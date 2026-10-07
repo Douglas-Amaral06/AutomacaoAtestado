@@ -297,3 +297,4 @@ def extract_document(path: Path) -> dict:
                 raise
             time.sleep(2 ** attempt)
     raise RuntimeError("O serviço de leitura não retornou um JSON válido.")
+#SOCORRO
