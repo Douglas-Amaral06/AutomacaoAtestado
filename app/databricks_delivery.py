@@ -56,7 +56,6 @@ UNIT_POLES = {
     "CERRADO": {"DF", "GO", "TO"},
     "BOJADOR": {"AC", "AL", "AM", "AP", "BA", "CE", "MA", "MS", "MT", "PA", "PB", "PE", "PI", "RN", "RO", "RR", "SE"},
     "MISSOES": {"PR", "RS", "SC"},
-    "TESTE": {"ZZ"},
 }
 
 
