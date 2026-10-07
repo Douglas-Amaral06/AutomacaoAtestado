@@ -5,10 +5,10 @@ from datetime import timedelta
 from pathlib import Path
 
 from .database import UPLOAD_DIR, connect
+from .databricks_delivery import normalize_delivery_document_type
 from .gemini_service import QuotaExceededError, extract_document
 from .safe_errors import format_safe_error
 from .security import redact, utc_now
-from .spreadsheet_pipeline import append_received_document, find_employee
 from .validation import normalize_cid, normalize_cpf, validation_summary
 
 
@@ -109,7 +109,7 @@ def process_queue_item(queue_id: int) -> dict:
         extracted = extract_document(path)
         extracted["cpf"] = normalize_cpf(extracted.get("cpf"))
         extracted["cid"] = normalize_cid(extracted.get("cid"))
-        if not extracted.get("is_atestado"):
+        if extracted.get("is_atestado") is not True or not normalize_delivery_document_type(extracted.get("tipo_documento")):
             path.unlink(missing_ok=True)
             with connect() as connection:
                 connection.execute(
@@ -120,35 +120,11 @@ def process_queue_item(queue_id: int) -> dict:
             add_log("info", "arquivo_ignorado", "Documento ignorado por classificação incompatível")
             return {"id": None, "status": "ignorado", "motivo": extracted.get("motivo_classificacao"), "tipo_documento": extracted.get("tipo_documento")}
 
-        employee = None
-        enrichment_status = "BASE_NAO_CONFIGURADA"
-        try:
-            employee, enrichment_status = find_employee(extracted.get("nome"), extracted.get("cpf"))
-        except RuntimeError:
-            pass
-        employee = employee or {}
-        validation = validation_summary({**extracted, "status_enriquecimento": enrichment_status})
-        renew_queue_lease(queue_id, lock_token)
-        spreadsheet_result = {"status": "desabilitada"}
-        if os.getenv("SPREADSHEET_PIPELINE_ENABLED", "true").strip().lower() == "true":
-            try:
-                spreadsheet_result = append_received_document(
-                    extracted, employee, item["arquivo_hash"], enrichment_status, validation
-                )
-            except (RuntimeError, OSError):
-                # A planilha é uma saída auxiliar. Caminho ausente, arquivo ocupado
-                # ou XLSX inválido não pode apagar uma extração válida nem impedir
-                # que o documento chegue ao painel e ao storage configurado.
-                spreadsheet_result = {"status": "indisponivel"}
-                add_log(
-                    "aviso",
-                    "planilha_indisponivel",
-                    "A planilha auxiliar não pôde ser atualizada; o processamento principal continuou.",
-                    {"fila_id": queue_id},
-                )
-
+        employee = {}
+        enrichment_status = None
         renew_queue_lease(queue_id, lock_token)
         with connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             owner = connection.execute(
                 "SELECT lock_token FROM fila_processamento WHERE id=?", (queue_id,)
             ).fetchone()
@@ -176,7 +152,7 @@ def process_queue_item(queue_id: int) -> dict:
                    WHERE id=? AND lock_token=?""",
                 (atestado_id, utc_now().isoformat(), queue_id, lock_token),
             )
-        add_log("info", "atestado_salvo", f"Atestado #{atestado_id} salvo para conferencia", {"enriquecimento": enrichment_status, "planilha": spreadsheet_result["status"], "entrega": "aguardando_aprovacao"})
+        add_log("info", "atestado_salvo", f"Atestado #{atestado_id} salvo para conferencia", {"entrega": "aguardando_aprovacao"})
         return {
             "id": atestado_id,
             "status": "pendente",

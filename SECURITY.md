@@ -1,42 +1,21 @@
-# Segurança e publicação
+# Segurança do piloto
 
-## Controles implementados
+- Argon2id com salt individual; bootstrap secreto e idempotente, sem senha em logs ou banco em texto puro.
+- Identidade pública opaca persistente: HMAC/APP_SECRET_KEY + usuário ou ID explícito.
+- Sessões aleatórias guardadas por SHA-256, expiração, vinculação ao navegador e verificação adicional de IP para administradores.
+- Cookies HttpOnly, SameSite=Strict e Secure no Render; chave e segredos preservados entre deploys.
+- CSRF e permissões em todas as mutações do painel; queries parametrizadas.
+- Bloqueio de login por conta/IP e IP global; senha de comparação para usuários inexistentes.
+- TrustedHost, CSP, proteção de frame, MIME sniffing e Referer. Sem CORS aberto.
+- Upload autenticado antes do multipart; limites declarado e efetivo de requisição, limite por arquivo, quota por usuário, MIME, magic bytes, PDF/imagem validada, UUID e SHA-256.
+- Extração externa bloqueada sem aprovação contratual e região declarada; orçamentos Gemini preservados.
+- Leases na fila e reserva atômica de revisão; somente entrega real concluída confirma atestado.
+- Documento enviado e relido para conferir SHA antes do JSON-sinal; OAuth M2M com credenciais externas.
+- Erros de entrega/extracão usam referência de correlação; não expõem mensagens brutas, conteúdo, credenciais ou payload médico.
+- Exportação XLSX em memória com fórmulas textuais neutralizadas.
+- Backups locais verificam manifesto/hashes e caminhos; worker ZIP desabilitado no Render.
+- `.env`, bancos, uploads, backups e saídas temporárias excluídos do Git.
 
-- Senhas com Argon2id, salt individual e sem armazenamento reversível.
-- Login do painel com usuário e senha, protegido por Argon2id e limitação de tentativas.
-- Sessões aleatórias armazenadas no banco somente pelo hash SHA-256.
-- Cookies `HttpOnly`, `SameSite=Strict` e `Secure` quando HTTPS estiver ativo.
-- CSRF nas alterações do painel e queries parametrizadas contra SQL injection.
-- Bloqueio combinado por usuário/IP e por IP global, impedindo contorno pela troca de nomes de usuário.
-- Comparação de senha com custo constante mesmo quando o usuário não existe.
-- Pareamento da extensão com código aleatório de seis dígitos, uso único e validade de dez minutos.
-- Token revogável e com validade de 90 dias, guardado no servidor somente como hash.
-- CSP, proteção contra iframe, MIME sniffing e vazamento por Referer.
-- Logs autenticados com CPF, e-mail, tokens, senhas e chaves mascarados.
-- Exportacoes XLSX geradas somente em memoria, sem copia persistente no projeto.
-- Caminhos das fontes do pipeline somente no `.env`, sem nomes ou acessos expostos no codigo.
-- Cruzamento executado localmente, com logs apenas agregados e sem dados pessoais.
-- Escrita da planilha serializada, atomica e com identificador de idempotencia oculto.
-- `.env`, banco, anexos, backups, QR Codes e exportacoes excluidos do Git.
-- Disjuntor LGPD bloqueando chamadas ao Gemini sem aprovacao contratual explicita e regiao declarada.
-- Orçamento local do Gemini com teto por resposta, documento, tentativas, chamadas e tokens de saída diários.
+O filesystem temporário é uma limitação expressamente aceita no piloto. Documentos aprovados têm persistência oficial no Databricks. Bootstrap não substitui uma gestão corporativa de identidade: senhas e APP_SECRET_KEY devem permanecer no gerenciador de segredos do ambiente.
 
-Use criptografia de disco corporativa (por exemplo, BitLocker) no computador que
-armazena banco, anexos e backups. O `.env` e a chave interna devem permanecer
-acessiveis somente ao usuario de servico autorizado.
-
-## Cloudflare
-
-A ativação exige domínio, conta e credenciais da empresa. Crie um Cloudflare
-Tunnel apontando para `127.0.0.1:8000`, use `cloudflare/config.yml.example` e
-proteja o hostname com Cloudflare Access. Depois configure:
-
-```env
-COOKIE_SECURE=true
-TRUST_CLOUDFLARE=true
-TRUSTED_PROXY_IPS=127.0.0.1,::1
-ALLOWED_HOSTS=atestados.suaempresa.com.br
-```
-
-Não publique a porta 8000 diretamente. Restrinja o firewall para que somente o
-`cloudflared` alcance a origem. No Access, exija identidade corporativa e MFA.
+Não confiar em cabeçalhos de proxy de origens arbitrárias. O serviço Render não utiliza cabeçalhos Cloudflare. O comando Uvicorn mantém sua lista restrita padrão; os cookies Secure e URLs relativas não dependem de interpretar o transporte interno como HTTPS.

@@ -1,10 +1,8 @@
 import sqlite3
 import uuid
-from pathlib import Path
+from .config import BASE_DIR, DATA_DIR
 
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "atestados.db"
 
@@ -88,16 +86,6 @@ def initialize_database() -> None:
                 criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(usuario_id) REFERENCES usuarios(id)
             );
-            CREATE TABLE IF NOT EXISTS tokens_servico (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nome TEXT NOT NULL,
-                token_hash TEXT NOT NULL UNIQUE,
-                ativo INTEGER NOT NULL DEFAULT 1,
-                criado_por INTEGER,
-                criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                ultimo_uso TEXT,
-                FOREIGN KEY(criado_por) REFERENCES usuarios(id)
-            );
             CREATE TABLE IF NOT EXISTS tentativas_login (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chave_hash TEXT NOT NULL,
@@ -105,24 +93,10 @@ def initialize_database() -> None:
                 criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_login_chave_data ON tentativas_login(chave_hash, criado_em);
-            CREATE TABLE IF NOT EXISTS recursos_lock (
-                nome TEXT PRIMARY KEY,
-                owner TEXT,
-                expires_at TEXT
-            );
             CREATE TABLE IF NOT EXISTS gemini_consumo (
                 dia TEXT PRIMARY KEY,
                 chamadas INTEGER NOT NULL DEFAULT 0,
                 tokens_reservados INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS codigos_pareamento (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                codigo_hash TEXT NOT NULL UNIQUE,
-                criado_por INTEGER NOT NULL,
-                expira_em TEXT NOT NULL,
-                usado_em TEXT,
-                criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(criado_por) REFERENCES usuarios(id)
             );
             CREATE TABLE IF NOT EXISTS fila_processamento (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,7 +113,6 @@ def initialize_database() -> None:
                 atualizado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(atestado_id) REFERENCES atestados(id)
             );
-            CREATE INDEX IF NOT EXISTS idx_fila_status ON fila_processamento(status, disponivel_em);
             """
         )
         user_columns = {row[1] for row in connection.execute("PRAGMA table_info(usuarios)").fetchall()}
@@ -156,37 +129,7 @@ def initialize_database() -> None:
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_usuarios_operador_public_id ON usuarios(operador_public_id)"
         )
-        for column in ("ultimo_totp_login", "ultimo_totp_extensao"):
-            if column not in user_columns:
-                connection.execute(f"ALTER TABLE usuarios ADD COLUMN {column} INTEGER")
-        token_columns = {row[1] for row in connection.execute("PRAGMA table_info(tokens_servico)").fetchall()}
-        if "expira_em" not in token_columns:
-            connection.execute("ALTER TABLE tokens_servico ADD COLUMN expira_em TEXT")
-        queue_columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(fila_processamento)").fetchall()
-        }
-        queue_extra_columns = {
-            "id_mensagem": "TEXT", "id_conversa": "TEXT", "whatsapp_remetente": "TEXT",
-            "data_recebimento": "TEXT", "unidade": "TEXT", "lock_token": "TEXT",
-            "lock_expires_em": "TEXT", "erro_amigavel": "TEXT",
-            "token_servico_id": "INTEGER", "operador_id": "INTEGER",
-        }
-        for column, definition in queue_extra_columns.items():
-            if column not in queue_columns:
-                connection.execute(f"ALTER TABLE fila_processamento ADD COLUMN {column} {definition}")
-        _migrate_queue_hash_uniqueness(connection)
-        connection.execute("CREATE INDEX IF NOT EXISTS idx_fila_arquivo_hash ON fila_processamento(arquivo_hash)")
-        connection.execute(
-            """UPDATE fila_processamento SET id_mensagem=NULL
-               WHERE id_mensagem IS NOT NULL AND id NOT IN (
-                   SELECT MIN(id) FROM fila_processamento
-                   WHERE id_mensagem IS NOT NULL GROUP BY id_mensagem
-               )"""
-        )
-        connection.execute(
-            """CREATE UNIQUE INDEX IF NOT EXISTS idx_fila_id_mensagem
-               ON fila_processamento(id_mensagem) WHERE id_mensagem IS NOT NULL"""
-        )
+        _migrate_queue(connection)
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS logs (
@@ -214,56 +157,62 @@ def initialize_database() -> None:
         )
 
 
-def _migrate_queue_hash_uniqueness(connection: sqlite3.Connection) -> None:
-    """Remove a unicidade antiga do SHA sem perder itens existentes da fila."""
-    schema = connection.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='fila_processamento'"
-    ).fetchone()[0]
-    compact = " ".join(schema.upper().split())
-    if "ARQUIVO_HASH TEXT NOT NULL UNIQUE" not in compact:
-        return
-    connection.executescript(
-        """
-        ALTER TABLE fila_processamento RENAME TO fila_processamento_anterior;
-        CREATE TABLE fila_processamento (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            arquivo_hash TEXT NOT NULL,
-            arquivo_original TEXT NOT NULL,
-            arquivo_salvo TEXT NOT NULL,
-            mime_type TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'processando',
-            tentativas INTEGER NOT NULL DEFAULT 0,
-            ultimo_erro TEXT,
-            disponivel_em TEXT,
-            atestado_id INTEGER,
-            criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            atualizado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            id_mensagem TEXT,
-            id_conversa TEXT,
-            whatsapp_remetente TEXT,
-            data_recebimento TEXT,
-            unidade TEXT,
-            lock_token TEXT,
-            lock_expires_em TEXT,
-            erro_amigavel TEXT,
-            FOREIGN KEY(atestado_id) REFERENCES atestados(id)
-        );
-        INSERT INTO fila_processamento(
-            id,arquivo_hash,arquivo_original,arquivo_salvo,mime_type,status,
-            tentativas,ultimo_erro,disponivel_em,atestado_id,criado_em,atualizado_em,
-            id_mensagem,id_conversa,whatsapp_remetente,data_recebimento,unidade,
-            lock_token,lock_expires_em,erro_amigavel
-        )
-        SELECT
-            id,arquivo_hash,arquivo_original,arquivo_salvo,mime_type,status,
-            tentativas,ultimo_erro,disponivel_em,atestado_id,criado_em,atualizado_em,
-            id_mensagem,id_conversa,whatsapp_remetente,data_recebimento,NULL,
-            NULL,NULL,NULL
-        FROM fila_processamento_anterior;
-        DROP TABLE fila_processamento_anterior;
-        CREATE INDEX idx_fila_status ON fila_processamento(status, disponivel_em);
-        """
-    )
+def _migrate_queue(connection: sqlite3.Connection) -> None:
+    """Reconstrói apenas a fila em transação; preserva IDs, vínculos e leases.
+
+    Os identificadores de canal antigo abaixo existem somente para migrar bancos
+    anteriores. Nenhuma rota ou serviço depende deles após esta conversão.
+    """
+    definitions = {
+        "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
+        "arquivo_hash": "TEXT NOT NULL", "arquivo_original": "TEXT NOT NULL",
+        "arquivo_salvo": "TEXT NOT NULL", "mime_type": "TEXT NOT NULL",
+        "status": "TEXT NOT NULL DEFAULT 'aguardando_retentativa'",
+        "tentativas": "INTEGER NOT NULL DEFAULT 0", "ultimo_erro": "TEXT",
+        "erro_amigavel": "TEXT", "disponivel_em": "TEXT", "atestado_id": "INTEGER",
+        "criado_em": "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+        "atualizado_em": "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+        "data_recebimento": "TEXT", "unidade": "TEXT", "polo": "TEXT",
+        "origem": "TEXT NOT NULL DEFAULT 'painel'", "operador_id": "INTEGER",
+        "lock_token": "TEXT", "lock_expires_em": "TEXT",
+    }
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(fila_processamento)")}
+    indexes = connection.execute("PRAGMA index_list(fila_processamento)").fetchall()
+    needs_rebuild = columns != set(definitions) or any(row[2] for row in indexes)
+    # executescript não é usado aqui: ele faria COMMIT implícito no meio da migração.
+    connection.execute("SAVEPOINT migracao_fila")
+    try:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "token_servico_id" in columns and "tokens_servico" in tables:
+            if "operador_id" not in columns:
+                connection.execute("ALTER TABLE fila_processamento ADD COLUMN operador_id INTEGER")
+                columns.add("operador_id")
+            connection.execute("""UPDATE fila_processamento SET operador_id=(
+                SELECT criado_por FROM tokens_servico WHERE id=fila_processamento.token_servico_id)
+                WHERE operador_id IS NULL""")
+        if needs_rebuild:
+            ddl = ",".join(f'"{name}" {kind}' for name, kind in definitions.items())
+            connection.execute(f"CREATE TABLE fila_nova ({ddl}, FOREIGN KEY(atestado_id) REFERENCES atestados(id))")
+            common = [name for name in definitions if name in columns]
+            names = ",".join(f'"{name}"' for name in common)
+            connection.execute(f"INSERT INTO fila_nova ({names}) SELECT {names} FROM fila_processamento")
+            connection.execute("DROP TABLE fila_processamento")
+            connection.execute("ALTER TABLE fila_nova RENAME TO fila_processamento")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_fila_status ON fila_processamento(status, disponivel_em)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_fila_arquivo_hash ON fila_processamento(arquivo_hash)")
+        connection.execute("UPDATE fila_processamento SET status='processando' WHERE status='processando_manual'")
+        connection.execute("""UPDATE atestados SET operador_envio_id=(
+            SELECT operador_id FROM fila_processamento WHERE atestado_id=atestados.id
+            AND operador_id IS NOT NULL ORDER BY id DESC LIMIT 1)
+            WHERE operador_envio_id IS NULL""")
+        connection.execute("DROP TABLE IF EXISTS codigos_pareamento")
+        connection.execute("DROP TABLE IF EXISTS tokens_servico")
+        # Campos antigos do usuário são ignorados para preservar contas existentes.
+        connection.execute("RELEASE SAVEPOINT migracao_fila")
+    except Exception:
+        connection.execute("ROLLBACK TO SAVEPOINT migracao_fila")
+        connection.execute("RELEASE SAVEPOINT migracao_fila")
+        raise
 
 
 def connect() -> sqlite3.Connection:

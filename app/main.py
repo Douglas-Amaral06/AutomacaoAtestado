@@ -4,55 +4,42 @@ import json
 import os
 import re
 import secrets
-import shutil
-import sqlite3
 import threading
 import time
-import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from datetime import timedelta
 from pathlib import Path
-from typing import Literal
 
-from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from openpyxl import Workbook
-from PIL import Image, UnidentifiedImageError
-from pydantic import BaseModel, ConfigDict, Field
 
 from .database import BASE_DIR, UPLOAD_DIR, connect, initialize_database, new_operator_public_id
 from .databricks_delivery import configured_delivery_service, prepare_processed_delivery, validate_prepared_delivery
-from .gemini_service import QuotaExceededError
 from .maintenance import BACKUP_DIR, apply_retention, create_backup, detect_orphan_files, prune_backups
 from .processing import QueueItemBusyError, add_log, process_queue_item, resume_pending_once, understandable_error
 from .rate_limit import check_daily_quota, check_rate_limit
 from .safe_errors import format_safe_error
-from .spreadsheet_pipeline import append_received_document, find_employee, remove_received_document, safe_excel_value
+from .export import safe_excel_value
+from .bootstrap import bootstrap_users
+from .config import positive_env_int
+from .uploads import ingest_document, MAX_MULTIPART_BYTES, UploadBodyLimit
 from .validation import document_type, normalize_cid, normalize_cpf, validation_summary
 from .security import (SESSION_COOKIE, attempt_retry_after, create_session, current_user,
-                       encrypt_totp, hash_password, hash_token, is_login_blocked, login_key, login_keys,
+                       encrypt_totp, hash_password, is_login_blocked, login_keys,
                        permissions_for, record_login, is_attempt_blocked, require_csrf, require_permission,
-                       trusted_client_ip, utc_now, verify_login_password,
-                       verify_service_token)
+                       trusted_client_ip, utc_now, verify_login_password)
 
-load_dotenv(BASE_DIR / ".env")
-initialize_database()
 templates = Jinja2Templates(directory=BASE_DIR / "app" / "templates")
 _worker_stop = threading.Event()
 
 
-def positive_env_int(name: str, default: int) -> int:
-    try:
-        value = int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-    return value if value > 0 else default
+class DeliveryCollisionError(RuntimeError):
+    """Dois recebimentos locais apontam para o mesmo identificador contratual."""
 
 
 def format_template_date(value, include_time: bool = False) -> str:
@@ -109,22 +96,37 @@ def maintenance_worker():
 
 @asynccontextmanager
 async def lifespan(_app):
+    if os.getenv("APP_ENV", "development").lower() in {"pilot", "production"}:
+        from .security import _app_secret
+        _app_secret()
+        if os.getenv("COOKIE_SECURE", "false").lower() != "true":
+            raise RuntimeError("O piloto exige COOKIE_SECURE=true")
+        if os.getenv("TRUST_CLOUDFLARE", "false").lower() != "false":
+            raise RuntimeError("No piloto Render, TRUST_CLOUDFLARE deve ser false")
+        if os.getenv("DATABRICKS_AUTH_MODE", "m2m").lower() != "m2m":
+            raise RuntimeError("O piloto exige autenticação M2M")
+    initialize_database()
+    bootstrap_users()
+    if os.getenv("APP_ENV", "development").lower() in {"pilot", "production"}:
+        with connect() as connection:
+            if not connection.execute("SELECT 1 FROM usuarios WHERE ativo=1 AND perfil='admin'").fetchone():
+                raise RuntimeError("Configure um administrador ativo em BOOTSTRAP_USERS_JSON antes de iniciar o piloto")
     _worker_stop.clear()
     thread = threading.Thread(target=queue_worker, daemon=True, name="fila-atestados")
     maintenance = threading.Thread(target=maintenance_worker, daemon=True, name="manutencao-atestados")
     thread.start()
-    maintenance.start()
-    yield
-    _worker_stop.set()
+    if os.getenv("LOCAL_BACKUP_ENABLED", "false").lower() == "true":
+        maintenance.start()
+    try:
+        yield
+    finally:
+        _worker_stop.set()
 
 
-app = FastAPI(title="Recebimento Seguro de Atestados", docs_url=None, redoc_url=None, lifespan=lifespan)
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=os.getenv("ALLOWED_HOSTS", "127.0.0.1,localhost").split(","))
-app.add_middleware(CORSMiddleware, allow_origins=[], allow_origin_regex=r"chrome-extension://.*", allow_methods=["POST","GET"], allow_headers=["Content-Type","X-API-Token"])
+app = FastAPI(title="Recebimento Seguro de Atestados", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=[host.strip() for host in os.getenv("ALLOWED_HOSTS", "127.0.0.1,localhost").split(",") if host.strip()])
+app.add_middleware(UploadBodyLimit)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "app" / "static", html=False), name="static")
-ALLOWED_TYPES = {"application/pdf", "image/jpeg", "image/png"}
-MAX_UPLOAD_BYTES = 15 * 1024 * 1024
-MAX_MULTIPART_BYTES = MAX_UPLOAD_BYTES + 1024 * 1024
 
 
 @app.exception_handler(Exception)
@@ -139,33 +141,6 @@ async def unexpected_exception_handler(_request: Request, error: Exception):
         status_code=500,
         content={"detail": {"codigo": "internal_error", "mensagem": safe_message}},
     )
-
-
-def detected_mime(path: Path) -> str | None:
-    head = path.read_bytes()[:16]
-    if head.startswith(b"%PDF-"): return "application/pdf"
-    if head.startswith(b"\xff\xd8\xff"): return "image/jpeg"
-    if head.startswith(b"\x89PNG\r\n\x1a\n"): return "image/png"
-    if head.startswith(b"RIFF") and head[8:12] == b"WEBP": return "image/webp"
-    return None
-
-
-def validate_document_structure(path: Path, mime_type: str) -> None:
-    if path.stat().st_size == 0:
-        raise HTTPException(400, "O arquivo está vazio.")
-    if mime_type == "application/pdf":
-        with path.open("rb") as source:
-            source.seek(max(0, path.stat().st_size - 2048))
-            if b"%%EOF" not in source.read():
-                raise HTTPException(400, "O PDF está incompleto ou corrompido.")
-        return
-    try:
-        with Image.open(path) as image:
-            image.verify()
-            if image.width <= 0 or image.height <= 0:
-                raise ValueError("dimensões inválidas")
-    except (UnidentifiedImageError, OSError, ValueError) as error:
-        raise HTTPException(400, "A imagem está corrompida ou incompleta.") from error
 
 
 def require_admin(user) -> None:
@@ -216,9 +191,10 @@ async def security_headers(request: Request, call_next):
 @app.middleware("http")
 async def upload_limits(request: Request, call_next):
     """Autentica e limita uploads antes de o FastAPI analisar o multipart."""
-    if request.method == "POST" and request.url.path == "/api/atestados":
+    if request.method == "POST" and request.url.path == "/atestados/upload":
         try:
-            token_id = verify_service_token(request)
+            user = current_user(request)
+            require_permission(user, "upload")
             declared_size = request.headers.get("content-length", "")
             if not declared_size.isdigit():
                 raise HTTPException(411, "Content-Length é obrigatório para uploads.")
@@ -227,17 +203,6 @@ async def upload_limits(request: Request, call_next):
                 raise HTTPException(400, "Upload vazio.")
             if incoming_bytes > MAX_MULTIPART_BYTES:
                 raise HTTPException(413, "Requisição de upload acima do limite permitido.")
-            check_rate_limit(
-                str(token_id),
-                limit=positive_env_int("UPLOAD_RATE_LIMIT_PER_HOUR", 30),
-                window_seconds=3600,
-            )
-            check_daily_quota(
-                str(token_id),
-                incoming_bytes,
-                max_bytes=positive_env_int("UPLOAD_DAILY_QUOTA_MB", 300) * 1024 * 1024,
-            )
-            request.state.upload_token_id = token_id
         except HTTPException as error:
             return JSONResponse(
                 status_code=error.status_code,
@@ -346,52 +311,6 @@ def toggle_user(user_id:int,request:Request,csrf_token:str=Form(...)):
     add_log("info","usuario_alternado",f"Status do usuario #{user_id} alterado por #{admin['id']}");return RedirectResponse("/usuarios",303)
 
 
-@app.get("/extensao", response_class=HTMLResponse)
-def extension_pairing_page(request: Request):
-    user=web_user(request)
-    if not user:return RedirectResponse("/login",303)
-    with connect() as connection:
-        query="""SELECT t.id,t.nome,t.ativo,t.criado_em,t.ultimo_uso,t.expira_em,
-                        u.nome operador_nome,u.usuario operador_usuario
-                 FROM tokens_servico t LEFT JOIN usuarios u ON u.id=t.criado_por"""
-        if user["perfil"] == "admin":
-            tokens=connection.execute(query+" ORDER BY t.id DESC").fetchall()
-        else:
-            tokens=connection.execute(query+" WHERE t.criado_por=? ORDER BY t.id DESC",(user["id"],)).fetchall()
-    return templates.TemplateResponse(request=request,name="pairing.html",context={"user":user,"csrf":user["csrf_token"],"codigo":None,"tokens":tokens})
-
-
-@app.post("/extensao/gerar-codigo", response_class=HTMLResponse)
-def generate_pairing_code(request:Request,csrf_token:str=Form(...)):
-    user=current_user(request);require_csrf(request,user,csrf_token)
-    code=f"{secrets.randbelow(1_000_000):06d}"
-    expires=utc_now()+timedelta(minutes=10)
-    with connect() as connection:
-        connection.execute("DELETE FROM codigos_pareamento WHERE criado_por=? AND usado_em IS NULL",(user["id"],))
-        connection.execute("INSERT INTO codigos_pareamento(codigo_hash,criado_por,expira_em) VALUES(?,?,?)",(hash_token(code),user["id"],expires.isoformat()))
-        query="""SELECT t.id,t.nome,t.ativo,t.criado_em,t.ultimo_uso,t.expira_em,
-                        u.nome operador_nome,u.usuario operador_usuario
-                 FROM tokens_servico t LEFT JOIN usuarios u ON u.id=t.criado_por"""
-        if user["perfil"] == "admin":
-            tokens=connection.execute(query+" ORDER BY t.id DESC").fetchall()
-        else:
-            tokens=connection.execute(query+" WHERE t.criado_por=? ORDER BY t.id DESC",(user["id"],)).fetchall()
-    add_log("info","pareamento_criado",f"Codigo de pareamento criado pelo usuario #{user['id']}")
-    return templates.TemplateResponse(request=request,name="pairing.html",context={"user":user,"csrf":user["csrf_token"],"codigo":code,"tokens":tokens})
-
-
-@app.post("/extensao/tokens/{token_id}/revogar")
-def revoke_extension_token(token_id:int,request:Request,csrf_token:str=Form(...)):
-    user=current_user(request);require_csrf(request,user,csrf_token)
-    with connect() as connection:
-        token=connection.execute("SELECT criado_por FROM tokens_servico WHERE id=?",(token_id,)).fetchone()
-        if not token: raise HTTPException(404,"Extensao inexistente")
-        if user["perfil"] != "admin" and token["criado_por"] != user["id"]:
-            raise HTTPException(403,"Operacao nao autorizada")
-        connection.execute("UPDATE tokens_servico SET ativo=0 WHERE id=?",(token_id,))
-    add_log("aviso","token_revogado",f"Token de extensao #{token_id} revogado por #{user['id']}");return RedirectResponse("/extensao",303)
-
-
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request, status: str = "", q: str = "", page: int = 1, per_page: int = 50):
     user = web_user(request)
@@ -448,6 +367,69 @@ def dashboard(request: Request, status: str = "", q: str = "", page: int = 1, pe
     })
 
 
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
+
+
+@app.get("/atestados/novo", response_class=HTMLResponse)
+def new_document(request: Request):
+    user = web_user(request)
+    if not user:
+        return RedirectResponse("/login", 303)
+    require_permission(user, "upload")
+    return upload_page(request, user)
+
+
+def upload_page(request, user, error=None, status_code=200):
+    return templates.TemplateResponse(request=request, name="upload.html", context={
+        "user": user, "csrf": user["csrf_token"], "error": error,
+        "unit": os.getenv("DELIVERY_UNIT", "AUREA"), "pole": os.getenv("DELIVERY_POLO", "SP"),
+        "reading_limit": positive_env_int("GEMINI_MAX_DOCUMENT_MB", 8),
+    }, status_code=status_code)
+
+
+def process_uploaded_item(queue_id):
+    try:
+        process_queue_item(queue_id)
+    except Exception:
+        pass  # A fila registra falhas e mantém o arquivo para retentativa.
+
+
+@app.post("/atestados/upload")
+def upload_document(request: Request, background_tasks: BackgroundTasks,
+                    file: UploadFile = File(...), csrf_token: str = Form(..., max_length=100)):
+    user = current_user(request)
+    require_csrf(request, user, csrf_token)
+    require_permission(user, "upload")
+    check_rate_limit(str(user["id"]), positive_env_int("UPLOAD_RATE_LIMIT_PER_HOUR", 30), 3600)
+    check_daily_quota(str(user["id"]), int(request.headers["content-length"]),
+                      positive_env_int("UPLOAD_DAILY_QUOTA_MB", 300) * 1024 * 1024)
+    try:
+        queue_id = ingest_document(file, user["id"])
+    except HTTPException as error:
+        return upload_page(request, user, error.detail, error.status_code)
+    background_tasks.add_task(process_uploaded_item, queue_id)
+    return RedirectResponse(f"/envios/{queue_id}", 303)
+
+
+@app.get("/envios/{queue_id}", response_class=HTMLResponse)
+def upload_status(queue_id: int, request: Request):
+    user = current_user(request)
+    require_permission(user, "upload")
+    with connect() as connection:
+        item = connection.execute("SELECT * FROM fila_processamento WHERE id=?", (queue_id,)).fetchone()
+        if not item or (item["operador_id"] != user["id"] and user["perfil"] != "admin"):
+            raise HTTPException(404, "Envio inexistente")
+        duplicate = connection.execute(
+            "SELECT 1 FROM fila_processamento WHERE arquivo_hash=? AND id<>? LIMIT 1",
+            (item["arquivo_hash"], queue_id),
+        ).fetchone() is not None
+    return templates.TemplateResponse(request=request, name="upload_status.html", context={
+        "user": user, "csrf": user["csrf_token"], "item": item, "duplicate": duplicate,
+    })
+
+
 @app.get("/atestados/{record_id}", response_class=HTMLResponse)
 def review_page(record_id: int, request: Request):
     user = web_user(request)
@@ -477,10 +459,10 @@ def review_document(
     data_atestado: str = Form("", max_length=10),
     observacoes: str = Form("", max_length=4000),
     motivo_rejeicao: str = Form("", max_length=1000),
-    matricula: str = Form("", max_length=80),
-    telefone: str = Form("", max_length=80),
-    email: str = Form("", max_length=254),
-    empresa: str = Form("", max_length=200),
+    matricula: str | None = Form(None, max_length=80),
+    telefone: str | None = Form(None, max_length=80),
+    email: str | None = Form(None, max_length=254),
+    empresa: str | None = Form(None, max_length=200),
     tipo_documento: str = Form("", max_length=40),
     crm: str = Form("", max_length=30),
     crm_uf: str = Form("", max_length=2),
@@ -495,11 +477,10 @@ def review_document(
     with connect() as connection:
         before=connection.execute("SELECT * FROM atestados WHERE id=?",(record_id,)).fetchone()
     if not before: raise HTTPException(404,"Registro inexistente")
-    try:
-        employee, enrichment_status = find_employee(nome, cpf)
-    except RuntimeError:
-        employee, enrichment_status = None, "BASE_NAO_CONFIGURADA"
-    employee = employee or {"matricula":matricula,"telefone":telefone,"email":email,"empresa":empresa}
+    employee = {key: value if value is not None else before[key] for key, value in {
+        "matricula": matricula, "telefone": telefone, "email": email, "empresa": empresa,
+    }.items()}
+    enrichment_status = before["status_enriquecimento"]
     signed_value = parse_optional_boolean(assinado, "assinatura")
     stamped_value = parse_optional_boolean(carimbado, "carimbo")
     reviewed = {"nome":nome.strip() or None,"cpf":normalize_cpf(cpf),"cid":normalize_cid(cid),"dias_afastamento":dias_afastamento.strip() or None,"data_atestado":data_atestado.strip() or None,"tipo_documento":document_type(tipo_documento) or tipo_documento.strip() or None,"status_enriquecimento":enrichment_status,"crm":crm.strip() or None,"crm_uf":crm_uf.strip().upper() or None,"assinado":signed_value,"carimbado":stamped_value}
@@ -509,71 +490,93 @@ def review_document(
         return templates.TemplateResponse(request=request, name="review.html", context=review_context(request, before, user, {**reviewed, **employee, "observacoes": observacoes, "motivo_rejeicao": motivo_rejeicao}, validation), status_code=422)
     days = int(dias_afastamento) if dias_afastamento.strip().isdigit() else None
     reviewed["dias_afastamento"] = days
-    delivery_id = before["id_documento"]
-    delivery_status = before["status_entrega"] or "aguardando_aprovacao"
     reservation = utc_now().isoformat()
+    lease_cutoff = (utc_now() - timedelta(minutes=30)).isoformat()
+    # Salva a edição antes da rede. A reserva é uma comparação atômica da versão
+    # e do estado, inclusive quando outra pessoa reabre a tela durante a entrega.
+    fields = {**reviewed, **employee, "observacoes": observacoes.strip() or None,
+              "motivo_rejeicao": motivo_rejeicao.strip() or None,
+              "revisado_por": user["id"], "revisado_em": reservation,
+              "status": "pendente" if acao == "aprovar" else "rejeitado",
+              "status_entrega": "entregando" if acao == "aprovar" else "rejeitado"}
     with connect() as connection:
+        assignments = ",".join(f"{key}=?" for key in fields)
         cursor = connection.execute(
-            """UPDATE atestados SET revisado_em=? WHERE id=?
-               AND COALESCE(revisado_em,criado_em)=?""",
-            (reservation, record_id, versao_registro),
+            f"""UPDATE atestados SET {assignments} WHERE id=?
+                AND COALESCE(revisado_em,criado_em)=?
+                AND status<>'confirmado' AND COALESCE(status_entrega,'')<>'entregue_volume'
+                AND (COALESCE(status_entrega,'')<>'entregando' OR revisado_em<?)""",
+            (*fields.values(), record_id, versao_registro, lease_cutoff),
         )
     if cursor.rowcount != 1:
-        raise HTTPException(409, "Este atestado foi alterado por outra pessoa. Reabra a tela antes de salvar.")
-    try:
-        if acao == "aprovar":
+        raise HTTPException(409, "Este atestado foi alterado, já foi confirmado ou está sendo enviado. Reabra a tela.")
+    if acao == "aprovar":
+        try:
+            mode = os.getenv("DELIVERY_MODE", "disabled").strip().lower()
+            if mode != "databricks" and os.getenv("APP_ENV", "development").lower() not in {"development", "local", "test"}:
+                raise RuntimeError("O piloto exige entrega real ao Databricks")
             delivery_service = configured_delivery_service()
-            if delivery_service is not None:
-                with connect() as connection:
-                    queue_item = connection.execute(
-                        """SELECT q.*,u.operador_public_id
-                           FROM fila_processamento q
-                           LEFT JOIN usuarios u ON u.id=q.operador_id
-                           WHERE q.atestado_id=? ORDER BY q.id DESC LIMIT 1""",
-                        (record_id,),
-                    ).fetchone()
-                document_path = UPLOAD_DIR / before["arquivo_salvo"]
-                if not queue_item or not document_path.is_file():
-                    raise HTTPException(409, "O documento original ou os metadados da fila não estão disponíveis para entrega.")
-                original = json.loads(before["dados_originais"] or "{}")
-                approved = {
-                    **original,
-                    **reviewed,
-                    "observacoes": observacoes.strip() or None,
-                    "is_atestado": True,
-                    "revisao_humana": {
-                        "status": "aprovado",
-                        "operador_id": queue_item["operador_public_id"],
-                        "data_revisao": reservation,
-                    },
-                }
-                prepared = prepare_processed_delivery(queue_item, approved, document_path.read_bytes())
-                validate_prepared_delivery(prepared)
-                delivery_service.deliver(prepared)
-                delivery_id = prepared.payload["id_documento"]
-                delivery_status = (
-                    "entregue_volume"
-                    if os.getenv("DELIVERY_MODE", "disabled").strip().lower() == "databricks"
-                    else "simulado_local"
+            if delivery_service is None:
+                raise RuntimeError("A entrega não está habilitada")
+            with connect() as connection:
+                queue_item = connection.execute(
+                    """SELECT q.*,u.operador_public_id FROM fila_processamento q
+                       LEFT JOIN usuarios u ON u.id=q.operador_id
+                       WHERE q.atestado_id=? ORDER BY q.id DESC LIMIT 1""", (record_id,),
+                ).fetchone()
+            document_path = UPLOAD_DIR / before["arquivo_salvo"]
+            if not queue_item or not document_path.is_file():
+                raise RuntimeError("Original ou metadados indisponíveis")
+            content = document_path.read_bytes()
+            if hashlib.sha256(content).hexdigest() != queue_item["arquivo_hash"]:
+                raise RuntimeError("Integridade do original não confere")
+            original = json.loads(before["dados_originais"] or "{}")
+            approved = {**original, **reviewed, "observacoes": observacoes.strip() or None,
+                        "is_atestado": True, "revisao_humana": {
+                            "status": "aprovado", "operador_id": user["operador_public_id"],
+                            "data_revisao": reservation,
+                        }}
+            prepared = prepare_processed_delivery(queue_item, approved, content)
+            validate_prepared_delivery(prepared)
+            with connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                collision = connection.execute(
+                    "SELECT 1 FROM atestados WHERE id_documento=? AND id<>?",
+                    (prepared.payload["id_documento"], record_id),
+                ).fetchone()
+                if collision:
+                    raise DeliveryCollisionError()
+                connection.execute("UPDATE atestados SET id_documento=? WHERE id=? AND revisado_em=?",
+                                   (prepared.payload["id_documento"], record_id, reservation))
+            delivery_service.deliver(prepared)
+            real_delivery = mode == "databricks"
+            status = "confirmado" if real_delivery else "pendente"
+            with connect() as connection:
+                cursor = connection.execute(
+                    """UPDATE atestados SET status=?,status_entrega=?,id_documento=?
+                       WHERE id=? AND revisado_em=? AND status_entrega='entregando'""",
+                    (status, "entregue_volume" if real_delivery else "simulado_local",
+                     prepared.payload["id_documento"], record_id, reservation),
                 )
-            else:
-                delivery_status = "desabilitada"
-        if before["arquivo_hash"]:
-            try:
-                append_received_document(reviewed,employee,before["arquivo_hash"],enrichment_status,validation)
-            except (RuntimeError, OSError):
-                add_log("aviso", "planilha_indisponivel", "A planilha auxiliar não pôde ser atualizada; a revisão principal continuou.", {"atestado_id": record_id})
-        with connect() as connection:
-            cursor = connection.execute("""UPDATE atestados SET nome=?,cpf=?,cid=?,dias_afastamento=?,data_atestado=?,observacoes=?,status=?,motivo_rejeicao=?,revisado_por=?,revisado_em=?,matricula=?,telefone=?,email=?,empresa=?,tipo_documento=?,status_enriquecimento=?,crm=?,crm_uf=?,assinado=?,carimbado=?,id_documento=?,status_entrega=? WHERE id=? AND revisado_em=?""",(nome.strip() or None,reviewed["cpf"],reviewed["cid"],days,data_atestado.strip() or None,observacoes.strip() or None,status,motivo_rejeicao.strip() or None,user["id"],reservation,employee.get("matricula") or None,employee.get("telefone") or None,employee.get("email") or None,employee.get("empresa") or None,reviewed["tipo_documento"],enrichment_status,reviewed["crm"],reviewed["crm_uf"],signed_value,stamped_value,delivery_id,delivery_status,record_id,reservation))
-        if cursor.rowcount != 1:
-            raise HTTPException(409, "A reserva de revisão expirou. Reabra a tela antes de salvar.")
-    except Exception:
-        with connect() as connection:
-            connection.execute(
-                "UPDATE atestados SET revisado_em=? WHERE id=? AND revisado_em=?",
-                (before["revisado_em"], record_id, reservation),
+                if cursor.rowcount != 1:
+                    raise RuntimeError("Reserva de entrega perdida")
+        except Exception as error:
+            safe_message, details = format_safe_error(error)
+            add_log("erro", "entrega_falhou", safe_message, {**details, "atestado_id": record_id})
+            with connect() as connection:
+                connection.execute(
+                    """UPDATE atestados SET status='pendente',status_entrega='falha_entrega'
+                       WHERE id=? AND revisado_em=? AND status_entrega='entregando'""", (record_id, reservation),
+                )
+                saved = connection.execute("SELECT * FROM atestados WHERE id=?", (record_id,)).fetchone()
+            context = review_context(request, saved, user)
+            context["delivery_error"] = (
+                "Não foi possível confirmar a entrega ao Databricks. Suas correções foram salvas. "
+                "O registro continua pendente; tente aprovar novamente. Referência: " + details["correlation_id"]
             )
-        raise
+            if isinstance(error, DeliveryCollisionError):
+                context["delivery_error"] = "Outro envio já utiliza este ID Databricks. Suas correções foram salvas. Envie novamente o documento para criar um novo recebimento."
+            return templates.TemplateResponse(request=request, name="review.html", context=context, status_code=503)
     changed_values = {**locals(), "assinado": signed_value, "carimbado": stamped_value, "crm_uf": reviewed["crm_uf"]}
     add_log("info","revisao",f"Atestado #{record_id} {status} por usuario #{user['id']}",{"campos_alterados":[k for k in ("nome","cpf","cid","dias_afastamento","data_atestado","observacoes","crm","crm_uf","assinado","carimbado") if str(before[k] if before[k] is not None else "")!=str(changed_values[k] if changed_values[k] is not None else "")]})
     return RedirectResponse("/",303)
@@ -584,19 +587,16 @@ def delete_document(record_id:int, request:Request, csrf_token:str=Form(...)):
     user=current_user(request); require_csrf(request,user,csrf_token)
     require_permission(user, "delete")
     with connect() as connection:
-        item=connection.execute("SELECT arquivo_salvo,arquivo_hash FROM atestados WHERE id=?",(record_id,)).fetchone()
+        connection.execute("BEGIN IMMEDIATE")
+        item=connection.execute("SELECT arquivo_salvo,arquivo_hash,status_entrega FROM atestados WHERE id=?",(record_id,)).fetchone()
         if not item:raise HTTPException(404,"Registro inexistente")
+        if item["status_entrega"] == "entregando":
+            raise HTTPException(409, "Aguarde a entrega antes de excluir o registro.")
         connection.execute("DELETE FROM fila_processamento WHERE atestado_id=?",(record_id,))
         connection.execute("DELETE FROM atestados WHERE id=?",(record_id,))
         still_used=connection.execute("SELECT COUNT(*) FROM atestados WHERE arquivo_salvo=?",(item["arquivo_salvo"],)).fetchone()[0]
-        same_content_remains=connection.execute("SELECT COUNT(*) FROM atestados WHERE arquivo_hash=?",(item["arquivo_hash"],)).fetchone()[0]
     if not still_used:
         (UPLOAD_DIR/item["arquivo_salvo"]).unlink(missing_ok=True)
-    if not same_content_remains:
-        try:
-            remove_received_document(item["arquivo_hash"])
-        except RuntimeError:
-            add_log("aviso","planilha_nao_atualizada","Registro excluido do sistema, mas a planilha automatica nao estava configurada")
     add_log("aviso","atestado_excluido",f"Atestado #{record_id} e arquivo removidos pelo usuario #{user['id']}")
     return RedirectResponse("/",303)
 
@@ -608,53 +608,9 @@ def download_original(record_id:int, request:Request):
     require_permission(user, "review")
     with connect() as connection: row=connection.execute("SELECT arquivo_original,arquivo_salvo FROM atestados WHERE id=?",(record_id,)).fetchone()
     if not row: raise HTTPException(404,"Registro inexistente")
+    if not (UPLOAD_DIR / row["arquivo_salvo"]).is_file():
+        raise HTTPException(404, "Original local indisponível. Documentos confirmados permanecem no Databricks.")
     return FileResponse(UPLOAD_DIR/row["arquivo_salvo"],filename=row["arquivo_original"],headers={"Content-Disposition":f"inline; filename=\"documento-{record_id}{Path(row['arquivo_original']).suffix}\""})
-
-
-class LogEntry(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    nivel: Literal["info", "aviso", "erro"] = "info"
-    evento: str = Field(min_length=1, max_length=80)
-    mensagem: str = Field(min_length=1, max_length=1000)
-    detalhes: dict | None = None
-
-
-class PairingRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    codigo: str = Field(pattern=r"^\d{6}$")
-    nome: str = Field(default="Extensao Chrome", min_length=1, max_length=80)
-
-
-@app.post("/api/parear")
-def pair_extension(entry:PairingRequest,request:Request):
-    key=login_key(request,"pareamento")
-    if is_attempt_blocked(key,max_failures=3,window_minutes=30):
-        retry=attempt_retry_after(key,30)
-        add_log("aviso","pareamento_bloqueado","Origem bloqueada apos 3 tentativas invalidas de pareamento",{"aguarde_segundos":retry})
-        raise HTTPException(429,{"codigo":"pareamento_bloqueado","mensagem":"Pareamento bloqueado apos 3 tentativas invalidas.","aguarde_segundos":retry})
-    code=entry.codigo.strip()
-    if len(code)!=6 or not code.isdigit():
-        record_login(key,False);raise HTTPException(400,"Codigo invalido")
-    with connect() as connection:
-        row=connection.execute("SELECT * FROM codigos_pareamento WHERE codigo_hash=? AND usado_em IS NULL AND expira_em>?",(hash_token(code),utc_now().isoformat())).fetchone()
-        if not row:
-            record_login(key,False);raise HTTPException(401,"Codigo incorreto ou expirado")
-        raw_token=secrets.token_urlsafe(48)
-        token_id=connection.execute("INSERT INTO tokens_servico(nome,token_hash,criado_por,expira_em) VALUES(?,?,?,?)",(entry.nome[:80],hash_token(raw_token),row["criado_por"],(utc_now()+timedelta(days=90)).isoformat())).lastrowid
-        connection.execute("UPDATE codigos_pareamento SET usado_em=? WHERE id=?",(utc_now().isoformat(),row["id"]))
-    record_login(key,True);add_log("info","extensao_pareada",f"Extensao #{token_id} pareada")
-    return {"token":raw_token,"token_id":token_id}
-
-
-@app.post("/api/logs")
-def create_log(entry:LogEntry, request:Request):
-    verify_service_token(request); add_log(entry.nivel,entry.evento,entry.mensagem,entry.detalhes); return {"ok":True}
-
-
-@app.get("/api/extensao/status")
-def extension_status(request:Request):
-    verify_service_token(request)
-    return {"conectada":True}
 
 
 @app.get("/logs",response_class=HTMLResponse)
@@ -664,111 +620,6 @@ def logs_page(request:Request):
     require_admin(user)
     with connect() as connection: rows=connection.execute("SELECT * FROM logs ORDER BY id DESC LIMIT 500").fetchall()
     return templates.TemplateResponse(request=request,name="logs.html",context={"logs":rows,"user":user,"csrf":user["csrf_token"]})
-
-
-@app.post("/api/atestados")
-def receive_document(
-    request: Request,
-    file: UploadFile = File(...),
-    id_mensagem: str = Form("", max_length=200),
-    id_conversa: str = Form("", max_length=200),
-    whatsapp_remetente: str = Form("", max_length=80),
-    data_recebimento: str = Form("", max_length=40),
-    unidade: str = Form("", max_length=30),
-):
-    stored_path = None
-    queue_id = None
-    try:
-        token_id = getattr(request.state, "upload_token_id", None)
-        operator_id = getattr(request.state, "manual_operator_id", None)
-        if isinstance(token_id, int):
-            with connect() as connection:
-                token_owner = connection.execute(
-                    "SELECT criado_por FROM tokens_servico WHERE id=?", (token_id,)
-                ).fetchone()
-            operator_id = token_owner["criado_por"] if token_owner else None
-        message_id = id_mensagem.strip()[:200] or None
-        if message_id:
-            with connect() as connection:
-                previous = connection.execute(
-                    "SELECT id,atestado_id FROM fila_processamento WHERE id_mensagem=?", (message_id,)
-                ).fetchone()
-            if previous:
-                return {"id": previous["atestado_id"], "status": "duplicado", "fila_id": previous["id"]}
-        if file.content_type not in ALLOWED_TYPES:
-            raise HTTPException(400, "Envie um arquivo PDF, JPG ou PNG.")
-        received_at = data_recebimento.strip()
-        if received_at:
-            try:
-                datetime.fromisoformat(received_at.replace("Z", "+00:00"))
-            except ValueError as error:
-                raise HTTPException(422, "Data de recebimento inválida.") from error
-        extensions = {"application/pdf": ".pdf", "image/jpeg": ".jpg", "image/png": ".png"}
-        stored_name = f"{uuid.uuid4().hex}{extensions[file.content_type]}"
-        stored_path = UPLOAD_DIR / stored_name
-        written = 0
-        digest_builder = hashlib.sha256()
-        with stored_path.open("xb") as output:
-            while chunk := file.file.read(1024 * 1024):
-                written += len(chunk)
-                if written > MAX_UPLOAD_BYTES:
-                    raise HTTPException(413, "Arquivo acima de 15 MB.")
-                digest_builder.update(chunk)
-                output.write(chunk)
-        gemini_input_limit = positive_env_int("GEMINI_MAX_DOCUMENT_MB", 8) * 1024 * 1024
-        if written > gemini_input_limit:
-            raise HTTPException(
-                413,
-                f"Documento acima do limite configurado para leitura ({gemini_input_limit // (1024 * 1024)} MB).",
-            )
-        actual_mime = detected_mime(stored_path)
-        if actual_mime != file.content_type:
-            raise HTTPException(400, "Conteúdo do arquivo não corresponde ao tipo informado.")
-        validate_document_structure(stored_path, actual_mime)
-        digest = digest_builder.hexdigest()
-        with connect() as connection:
-            possible_duplicate_count = connection.execute(
-                "SELECT COUNT(*) FROM fila_processamento WHERE arquivo_hash=?", (digest,)
-            ).fetchone()[0]
-        with connect() as connection:
-            cursor=connection.execute("""INSERT INTO fila_processamento(
-                arquivo_hash,arquivo_original,arquivo_salvo,mime_type,status,
-                id_mensagem,id_conversa,whatsapp_remetente,data_recebimento,unidade,
-                token_servico_id,operador_id
-            ) VALUES(?,?,?,?, 'aguardando_retentativa',?,?,?,?,?,?,?)""",(
-                digest,Path(file.filename or "documento").name[:255],stored_name,file.content_type,
-                message_id,id_conversa.strip()[:200] or None,
-                whatsapp_remetente.strip()[:80] or None,received_at or None,
-                unidade.strip().upper()[:30] or None,
-                token_id if isinstance(token_id,int) else None,operator_id,
-            ))
-            queue_id=cursor.lastrowid
-    except sqlite3.IntegrityError:
-        if stored_path:
-            stored_path.unlink(missing_ok=True)
-        with connect() as connection:
-            previous = connection.execute(
-                "SELECT id,atestado_id FROM fila_processamento WHERE id_mensagem=?", (message_id,)
-            ).fetchone()
-        if previous:
-            return {"id": previous["atestado_id"], "status": "duplicado", "fila_id": previous["id"]}
-        raise
-    except Exception:
-        if queue_id is None and stored_path:
-            stored_path.unlink(missing_ok=True)
-        raise
-    finally:
-        file.file.close()
-    try:
-        result = process_queue_item(queue_id)
-        if possible_duplicate_count:
-            result["possivel_repeticao"] = True
-            result["aviso"] = "Possível documento repetido. O reenvio foi aceito para conferência."
-        return result
-    except QuotaExceededError as error: raise HTTPException(429,detail={"codigo":"gemini_quota_exceeded","mensagem":"Limite temporário do serviço de leitura atingido.","aguarde_segundos":error.retry_after}) from error
-    except Exception as error: raise HTTPException(503,detail={"codigo":"enfileirado","mensagem":"Falha temporaria; arquivo preservado para nova tentativa.","fila_id":queue_id}) from error
-
-
 
 
 @app.post("/fila/retomar")
@@ -785,6 +636,7 @@ def reprocess_queue_item(queue_id: int, request: Request, csrf_token: str = Form
     require_csrf(request, user, csrf_token)
     require_permission(user, "reprocess")
     with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
         item = connection.execute(
             "SELECT status,atestado_id FROM fila_processamento WHERE id=?", (queue_id,)
         ).fetchone()
@@ -807,110 +659,6 @@ def reprocess_queue_item(queue_id: int, request: Request, csrf_token: str = Form
         pass
     return RedirectResponse("/", 303)
 
-    @app.post("/fila/{queue_id}/excluir")
-    def delete_failed_queue_item(
-    queue_id: int,
-    request: Request,
-    csrf_token: str = Form(...),
-):
-     user = current_user(request)
-    require_csrf(request, user, csrf_token)
-    require_permission(user, "delete")
-
-    with connect() as connection:
-        item = connection.execute(
-            """
-            SELECT
-                id,
-                arquivo_salvo,
-                arquivo_original,
-                arquivo_hash,
-                status,
-                atestado_id
-            FROM fila_processamento
-            WHERE id=?
-            """,
-            (queue_id,),
-        ).fetchone()
-
-        if not item:
-            raise HTTPException(
-                404,
-                "Item da fila inexistente",
-            )
-
-        # Evita excluir itens que já viraram um atestado válido.
-        if item["atestado_id"]:
-            raise HTTPException(
-                409,
-                "Esta extração já possui um atestado associado e não pode ser removida por aqui.",
-            )
-
-        allowed_statuses = {
-            "falhou",
-            "pausado_quota",
-            "aguardando_retentativa",
-        }
-
-        if item["status"] not in allowed_statuses:
-            raise HTTPException(
-                409,
-                "Somente extrações com falha podem ser excluídas.",
-            )
-
-        arquivo_salvo = item["arquivo_salvo"]
-        arquivo_hash = item["arquivo_hash"]
-        arquivo_original = item["arquivo_original"]
-
-        connection.execute(
-            "DELETE FROM fila_processamento WHERE id=?",
-            (queue_id,),
-        )
-
-        # Verifica se outro item da fila ainda usa o mesmo arquivo.
-        queue_file_uses = connection.execute(
-            """
-            SELECT COUNT(*)
-            FROM fila_processamento
-            WHERE arquivo_salvo=?
-            """,
-            (arquivo_salvo,),
-        ).fetchone()[0]
-
-        # Verifica se algum atestado usa o arquivo.
-        document_file_uses = connection.execute(
-            """
-            SELECT COUNT(*)
-            FROM atestados
-            WHERE arquivo_salvo=?
-            """,
-            (arquivo_salvo,),
-        ).fetchone()[0]
-
-    # Remove o arquivo físico somente quando ninguém mais o utiliza.
-    if (
-        arquivo_salvo
-        and queue_file_uses == 0
-        and document_file_uses == 0
-    ):
-        (UPLOAD_DIR / arquivo_salvo).unlink(
-            missing_ok=True
-        )
-
-    add_log(
-        "aviso",
-        "extracao_falha_excluida",
-        (
-            f"Fila #{queue_id} removida "
-            f"pelo usuario #{user['id']}"
-        ),
-        {
-            "arquivo": arquivo_original,
-            "arquivo_hash": arquivo_hash,
-        },
-    )
-
-    return RedirectResponse("/", 303)
 
 @app.post("/fila/{queue_id}/excluir")
 def delete_queue_item(
@@ -924,6 +672,7 @@ def delete_queue_item(
     require_permission(user, "delete")
 
     with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
         item = connection.execute(
             """
             SELECT

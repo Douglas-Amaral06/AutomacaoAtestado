@@ -196,7 +196,6 @@ def apply_retention() -> dict:
             connection.execute(f"DELETE FROM fila_processamento WHERE atestado_id IN ({placeholders})", ids)
             connection.execute(f"DELETE FROM atestados WHERE id IN ({placeholders})", ids)
         connection.execute("DELETE FROM sessoes WHERE expira_em<?", (utc_now().isoformat(),))
-        connection.execute("DELETE FROM codigos_pareamento WHERE expira_em<?", (utc_now().isoformat(),))
         connection.execute("DELETE FROM tentativas_login WHERE criado_em<?", (log_cutoff,))
         connection.execute("DELETE FROM logs WHERE criado_em<?", (log_cutoff,))
     return {"enabled": True, "records": len(expired), "files": files_removed}

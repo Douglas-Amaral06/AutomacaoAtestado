@@ -11,11 +11,16 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .storage_client import DatabricksStorageClient, LocalFakeStorageClient, StorageClient
+from .storage_client import (
+    DatabricksCliStorageClient,
+    DatabricksStorageClient,
+    LocalFakeStorageClient,
+    StorageClient,
+)
 from .validation import document_type as normalize_document_type
 
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.2"
 try:
     SAO_PAULO = ZoneInfo("America/Sao_Paulo")
 except ZoneInfoNotFoundError:
@@ -46,14 +51,23 @@ def sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def build_document_id(unidade: str, data_recebimento: datetime, sha256: str) -> str:
-    """Monta ``UNIDADE_AAAAMMDDTHHMMSS_sha8`` conforme o contrato."""
-    if not unidade or not unidade.strip():
-        raise ValueError("Unidade é obrigatória.")
+UNIT_POLES = {
+    "AUREA": {"ES", "MG", "RJ", "SP"},
+    "CERRADO": {"DF", "GO", "TO"},
+    "BOJADOR": {"AC", "AL", "AM", "AP", "BA", "CE", "MA", "MS", "MT", "PA", "PB", "PE", "PI", "RN", "RO", "RR", "SE"},
+    "MISSOES": {"PR", "RS", "SC"},
+    "TESTE": {"ZZ"},
+}
+
+
+def build_document_id(polo: str, data_recebimento: datetime, sha256: str) -> str:
+    """Monta ``POLO_AAAAMMDDTHHMMSS_sha8`` conforme o contrato 1.2."""
+    if not polo or not re.fullmatch(r"[A-Z]{2}", polo.strip().upper()):
+        raise ValueError("Polo deve ser uma sigla de duas letras.")
     if len(sha256) != 64:
         raise ValueError("SHA-256 inválido.")
     local_time = _as_sao_paulo(data_recebimento)
-    return f"{unidade.strip()}_{local_time:%Y%m%dT%H%M%S}_{sha256[:8]}"
+    return f"{polo.strip().upper()}_{local_time:%Y%m%dT%H%M%S}_{sha256[:8]}"
 
 
 def _as_sao_paulo(value: datetime) -> datetime:
@@ -102,18 +116,23 @@ def prepare_delivery(
     original_name: str,
     mime: str,
     unidade: str,
+    polo: str,
+    teste: bool,
     data_recebimento: datetime | str,
     origem: dict,
     extracao: dict,
     documento: dict,
     volume_root: str = OFFICIAL_VOLUME_ROOT,
 ) -> PreparedDelivery:
-    """Prepara uma entrega real conforme contrato 1.0, sem acessar storage."""
+    """Prepara uma entrega real conforme contrato 1.2, sem acessar storage."""
     if not document_content:
         raise ValueError("O documento não pode ser vazio.")
     normalized_unit = unidade.strip().upper()
-    if not re.fullmatch(r"[A-Z0-9_-]+", normalized_unit):
-        raise ValueError("Unidade deve estar em maiúsculas, sem espaço ou acento.")
+    normalized_pole = polo.strip().upper()
+    if normalized_unit not in UNIT_POLES or normalized_pole not in UNIT_POLES[normalized_unit]:
+        raise ValueError("Par unidade/polo não previsto no contrato Databricks 1.2.")
+    if not isinstance(teste, bool) or teste != (normalized_unit == "TESTE" and normalized_pole == "ZZ"):
+        raise ValueError("Documento de teste deve usar exclusivamente TESTE/ZZ.")
     extension = SUPPORTED_EXTENSIONS.get(mime.strip().lower())
     if not extension:
         raise ValueError("Tipo de arquivo não previsto no contrato Databricks.")
@@ -121,8 +140,8 @@ def prepare_delivery(
     received_at = parse_timestamp(data_recebimento)
     extracted_at = parse_timestamp(extracao.get("data_extracao"), fallback=received_at)
     digest = sha256_bytes(document_content)
-    document_id = build_document_id(normalized_unit, received_at, digest)
-    relative = PurePosixPath(normalized_unit) / f"{received_at:%Y}" / f"{received_at:%m}" / f"{received_at:%d}"
+    document_id = build_document_id(normalized_pole, received_at, digest)
+    relative = PurePosixPath(normalized_unit) / normalized_pole / f"{received_at:%Y}" / f"{received_at:%m}" / f"{received_at:%d}"
     document_relative_path = relative / f"{document_id}.{extension}"
     json_relative_path = relative / f"{document_id}.json"
 
@@ -144,7 +163,8 @@ def prepare_delivery(
         "assinado": documento.get("assinado") if isinstance(documento.get("assinado"), bool) else None,
         "carimbado": documento.get("carimbado") if isinstance(documento.get("carimbado"), bool) else None,
     }
-    missing = [key for key, value in document_values.items() if value is None]
+    not_applicable = {"crm", "crm_uf", "cid", "dias_afastamento"} if official_document_type == "Comprovante de horas" else set()
+    missing = [key for key, value in document_values.items() if value is None and key not in not_applicable]
     confidence = extracao.get("confianca_geral")
     if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
         confidence = None
@@ -153,14 +173,16 @@ def prepare_delivery(
         "versao_schema": SCHEMA_VERSION,
         "id_documento": document_id,
         "origem": {
-            "canal": "whatsapp",
+            "canal": "painel",
             "operador_id": _nullable(origem.get("operador_id")),
-            "id_mensagem": _nullable(origem.get("id_mensagem")),
-            "id_conversa": _nullable(origem.get("id_conversa")),
-            "whatsapp_remetente": _nullable(origem.get("whatsapp_remetente")),
-            "whatsapp_destinatario": _nullable(origem.get("whatsapp_destinatario")),
+            "id_mensagem": None,
+            "id_conversa": None,
+            "whatsapp_remetente": None,
+            "whatsapp_destinatario": None,
             "unidade": normalized_unit,
+            "polo": normalized_pole,
             "data_recebimento": received_at.isoformat(timespec="seconds"),
+            "teste": teste,
         },
         "arquivo": {
             "nome_original": original_name,
@@ -201,18 +223,23 @@ def prepare_processed_delivery(item, extracted: dict, document_content: bytes) -
     if not received_at:
         created_at = datetime.fromisoformat(item["criado_em"])
         received_at = created_at.replace(tzinfo=timezone.utc) if created_at.tzinfo is None else created_at
+    test_mode = os.getenv("DELIVERY_TEST", "false").strip().lower() == "true"
+    unidade = "TESTE" if test_mode else (
+        (item["unidade"] if "unidade" in item.keys() else None) or os.getenv("DELIVERY_UNIT", "AUREA")
+    )
+    polo = "ZZ" if test_mode else (
+        (item["polo"] if "polo" in item.keys() else None) or os.getenv("DELIVERY_POLO", "SP")
+    )
     return prepare_delivery(
         document_content=document_content,
         original_name=item["arquivo_original"],
         mime=item["mime_type"],
-        unidade=(item["unidade"] if "unidade" in item.keys() else None) or os.getenv("DELIVERY_UNIT", "UNI001"),
+        unidade=unidade,
+        polo=polo,
+        teste=test_mode,
         data_recebimento=received_at,
         origem={
             "operador_id": item["operador_public_id"] if "operador_public_id" in item.keys() else None,
-            "id_mensagem": item["id_mensagem"],
-            "id_conversa": item["id_conversa"],
-            "whatsapp_remetente": item["whatsapp_remetente"],
-            "whatsapp_destinatario": os.getenv("DELIVERY_WHATSAPP_DESTINATION") or None,
         },
         extracao={
             "motor": "google-gemini",
@@ -313,7 +340,7 @@ def validate_prepared_delivery(prepared: PreparedDelivery) -> None:
     )
     origem = _require_keys(
         payload["origem"],
-        {"canal", "operador_id", "id_mensagem", "id_conversa", "whatsapp_remetente", "whatsapp_destinatario", "unidade", "data_recebimento"},
+        {"canal", "operador_id", "id_mensagem", "id_conversa", "whatsapp_remetente", "whatsapp_destinatario", "unidade", "polo", "data_recebimento", "teste"},
         "origem",
     )
     arquivo = _require_keys(
@@ -335,25 +362,24 @@ def validate_prepared_delivery(prepared: PreparedDelivery) -> None:
     document_id = payload["id_documento"]
     if payload["versao_schema"] != SCHEMA_VERSION:
         raise ContractValidationError("versao_schema não corresponde ao contrato vigente.")
-    if not isinstance(document_id, str) or not re.fullmatch(r"[A-Z0-9_-]+_\d{8}T\d{6}_[0-9a-f]{8}", document_id):
+    if not isinstance(document_id, str) or not re.fullmatch(r"[A-Z]{2}_\d{8}T\d{6}_[0-9a-f]{8}", document_id):
         raise ContractValidationError("id_documento possui formato inválido.")
-    if origem["canal"] != "whatsapp":
-        raise ContractValidationError("origem.canal deve ser whatsapp.")
-    if origem["operador_id"] is not None and (
+    if origem["canal"] != "painel":
+        raise ContractValidationError("origem.canal deve ser painel.")
+    if (
         not isinstance(origem["operador_id"], str)
         or not re.fullmatch(r"opr_[0-9a-f]{32}", origem["operador_id"])
     ):
-        raise ContractValidationError("origem.operador_id deve ser opaco ou null.")
-    if not isinstance(origem["unidade"], str) or not re.fullmatch(r"[A-Z0-9_-]+", origem["unidade"]):
-        raise ContractValidationError("origem.unidade possui formato inválido.")
-    if not document_id.startswith(f"{origem['unidade']}_"):
-        raise ContractValidationError("id_documento e origem.unidade não correspondem.")
-    for field in ("id_mensagem", "id_conversa"):
-        if origem[field] is not None and not isinstance(origem[field], str):
-            raise ContractValidationError(f"origem.{field} deve ser texto ou null.")
-    for field in ("whatsapp_remetente", "whatsapp_destinatario"):
-        if not isinstance(origem[field], str) or not re.fullmatch(r"\+[1-9]\d{7,14}", origem[field]):
-            raise ContractValidationError(f"origem.{field} deve estar no formato E.164.")
+        raise ContractValidationError("origem.operador_id deve ser um identificador opaco válido.")
+    if origem["unidade"] not in UNIT_POLES or origem["polo"] not in UNIT_POLES[origem["unidade"]]:
+        raise ContractValidationError("origem.unidade e origem.polo não formam um par válido.")
+    if not isinstance(origem["teste"], bool) or origem["teste"] != (origem["unidade"] == "TESTE" and origem["polo"] == "ZZ"):
+        raise ContractValidationError("origem.teste não corresponde à unidade e ao polo.")
+    if not document_id.startswith(f"{origem['polo']}_"):
+        raise ContractValidationError("id_documento e origem.polo não correspondem.")
+    for field in ("id_mensagem", "id_conversa", "whatsapp_remetente", "whatsapp_destinatario"):
+        if origem[field] is not None:
+            raise ContractValidationError(f"origem.{field} deve ser null para o canal painel.")
     _require_aware_iso(origem["data_recebimento"], "origem.data_recebimento")
 
     expected_extension = SUPPORTED_EXTENSIONS.get(arquivo["mime"] if isinstance(arquivo["mime"], str) else "")
@@ -380,7 +406,8 @@ def validate_prepared_delivery(prepared: PreparedDelivery) -> None:
     confidence = extracao["confianca_geral"]
     if confidence is not None and (isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1):
         raise ContractValidationError("extracao.confianca_geral deve estar entre 0 e 1 ou ser null.")
-    expected_missing = {field for field, value in documento.items() if value is None}
+    not_applicable = {"crm", "crm_uf", "cid", "dias_afastamento"} if documento["tipo_documento"] == "Comprovante de horas" else set()
+    expected_missing = {field for field, value in documento.items() if value is None and field not in not_applicable}
     missing_fields = extracao["campos_ausentes"]
     if not isinstance(missing_fields, list) or any(not isinstance(field, str) for field in missing_fields) or set(missing_fields) != expected_missing:
         raise ContractValidationError("extracao.campos_ausentes não corresponde aos campos nulos.")
@@ -457,22 +484,38 @@ def databricks_storage_from_env() -> DatabricksStorageClient:
         attempts = int(os.getenv("DATABRICKS_MAX_ATTEMPTS", "3"))
     except ValueError as error:
         raise RuntimeError("Timeout ou número de tentativas do Databricks inválido.") from error
+    common = {
+        "host": os.getenv("DATABRICKS_HOST", ""),
+        "volume_root": os.getenv("DATABRICKS_VOLUME_ROOT", OFFICIAL_VOLUME_ROOT),
+        "timeout_seconds": timeout,
+        "max_attempts": attempts,
+    }
+    auth_mode = os.getenv("DATABRICKS_AUTH_MODE", "m2m").strip().lower()
+    if auth_mode == "cli":
+        if os.getenv("APP_ENV", "development").strip().lower() not in {"development", "local", "test"}:
+            raise RuntimeError("Autenticação U2M pela CLI é permitida somente no ambiente local.")
+        return DatabricksCliStorageClient(
+            **common,
+            cli_path=os.getenv("DATABRICKS_CLI_PATH", ""),
+            profile=os.getenv("DATABRICKS_CLI_PROFILE", "atestados-u2m"),
+        )
+    if auth_mode != "m2m":
+        raise RuntimeError("DATABRICKS_AUTH_MODE deve ser 'm2m' ou 'cli'.")
     return DatabricksStorageClient(
-        host=os.getenv("DATABRICKS_HOST", ""),
+        **common,
         client_id=os.getenv("DATABRICKS_CLIENT_ID", ""),
         client_secret=os.getenv("DATABRICKS_CLIENT_SECRET", ""),
-        volume_root=os.getenv("DATABRICKS_VOLUME_ROOT", OFFICIAL_VOLUME_ROOT),
-        timeout_seconds=timeout,
-        max_attempts=attempts,
     )
 
 
 class LocalDeliverySimulator:
     """Adaptador local que une preparação, delivery e o fake storage em testes."""
 
-    def __init__(self, root: Path, unidade: str = "UNI001") -> None:
+    def __init__(self, root: Path, unidade: str = "TESTE", polo: str = "ZZ") -> None:
         self.root = Path(root)
-        self.unidade = unidade
+        self.unidade = unidade.strip().upper()
+        self.polo = polo.strip().upper()
+        self.teste = self.unidade == "TESTE" and self.polo == "ZZ"
         self.storage = LocalFakeStorageClient(root)
         self.delivery_service = DeliveryService(self.storage)
 
@@ -504,8 +547,10 @@ class LocalDeliverySimulator:
         if not content:
             raise ValueError("O documento não pode ser vazio.")
         digest = sha256_bytes(content)
-        document_id = build_document_id(self.unidade, local_time, digest)
-        relative = PurePosixPath(self.unidade) / f"{local_time:%Y}" / f"{local_time:%m}" / f"{local_time:%d}"
+        if self.unidade not in UNIT_POLES or self.polo not in UNIT_POLES[self.unidade]:
+            raise ValueError("Par unidade/polo inválido no simulador.")
+        document_id = build_document_id(self.polo, local_time, digest)
+        relative = PurePosixPath(self.unidade) / self.polo / f"{local_time:%Y}" / f"{local_time:%m}" / f"{local_time:%d}"
         document_relative_path = relative / f"{document_id}.{normalized_extension}"
         json_relative_path = relative / f"{document_id}.json"
         payload = self._payload(
@@ -530,14 +575,16 @@ class LocalDeliverySimulator:
             "versao_schema": SCHEMA_VERSION,
             "id_documento": document_id,
             "origem": {
-                "canal": "whatsapp",
-                "operador_id": None,
-                "id_mensagem": f"wamid.SIMULADO.{registro['id_atestado']}",
-                "id_conversa": f"simulado-{registro['matricula']}@c.us",
-                "whatsapp_remetente": f"+551190000{sequence:04d}",
-                "whatsapp_destinatario": "+5511980000000",
+                "canal": "painel",
+                "operador_id": "opr_" + "0" * 32,  # Identidade sintética exclusiva do simulador.
+                "id_mensagem": None,
+                "id_conversa": None,
+                "whatsapp_remetente": None,
+                "whatsapp_destinatario": None,
                 "unidade": self.unidade,
+                "polo": self.polo,
                 "data_recebimento": data_recebimento.isoformat(timespec="seconds"),
+                "teste": self.teste,
             },
             "arquivo": {
                 "nome_original": nome_original,

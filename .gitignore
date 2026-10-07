@@ -15,3 +15,15 @@ data/onboarding/*
 data/homologacao_fake/*
 .audit-*/
 .spreadsheet-work/
+
+# Saídas temporárias e dados locais (fixtures CSV sintéticas são mantidas).
+output/
+tmp/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite*
+.env.*
+!.env.example
+data/fixtures/databricks_delivery/

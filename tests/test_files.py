@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from app.main import detected_mime
+from app.uploads import detected_mime
 
 
 def test_magic_byte_detection(tmp_path: Path):

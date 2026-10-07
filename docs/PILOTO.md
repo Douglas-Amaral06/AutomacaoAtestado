@@ -1,47 +1,41 @@
-# Roteiro do piloto interno
+# Roteiro do piloto — Frequência / AUREA / SP
 
-Use somente documentos ficticios durante a homologacao. Execute os cenarios
-abaixo com 1 ou 2 analistas e registre qualquer falha na pagina **Logs**.
+Executar na URL Render com documentos sintéticos ou autorizados. Registrar evidência por caso, sem CPF, nomes, conteúdo médico ou segredos em logs compartilhados. O código local não substitui a validação na conta Render e com a Service Principal do ambiente.
 
-## Antes do teste
+| Caso | Resultado esperado |
+|---|---|
+| 1. Login do analista | Sessão HttpOnly, Secure e SameSite; painel acessível |
+| 2. JPG válido | Leitura e revisão com original preservado |
+| 3. PNG válido | Leitura e revisão com original preservado |
+| 4. PDF válido | Estrutura validada, leitura e revisão |
+| 5. Arquivo corrompido, vazio, MIME falso ou acima do limite | Mensagem segura; nenhuma fila/arquivo residual |
+| 6. Arquivo não-atestado | Ignorado, sem atestado válido nem envio externo ao Volume |
+| 7. Mesmo documento duas vezes | Dois recebimentos, aviso de possível repetição; sem bloqueio por SHA |
+| 8. Gemini indisponível | Arquivo preservado; retentativa e mensagem amigável |
+| 9. Gemini 429 | Item pausado por quota; retomada pelo administrador |
+| 10. Revisão | Original, campos e validações visíveis |
+| 11. Correção manual | Campos enviados no JSON; dados auxiliares existentes preservados |
+| 12. Rejeição com motivo | Rejeitado; nenhuma chamada de entrega |
+| 13. Confirmação | Estado confirmado somente após entrega real concluída |
+| 14. Original no Databricks | Documento no diretório correto do Volume |
+| 15. JSON no Databricks | Nome-base igual ao documento e ao id_documento |
+| 16. SHA | SHA-256 do JSON corresponde aos bytes originais e remotos |
+| 17. Operador | origem.operador_id corresponde ao remetente autenticado; revisor identificado na revisão humana |
+| 18. Unidade | AUREA, definida pelo backend |
+| 19. Polo | SP, definido pelo backend |
+| 20. Canal | painel; campos contratuais antigos nulos |
+| 21. Rejeitado | Nenhum documento/JSON novo aparece no Volume |
+| 22. Erro Databricks | Pendente/falha_entrega; edição preservada, aprovação pode ser tentada novamente |
+| 23. Concorrência | Segunda aprovação/rejeição/exclusão bloqueada durante entrega |
+| 24. Acesso indevido | Sem sessão, CSRF inválido e perfil sem upload recusados |
+| 25. Redeploy com perda de SQLite | Usuários bootstrap recriados; mesmo operador_public_id; reenvio de pendentes pode ser necessário |
+| 26. Confirmado sem arquivo local | Original retorna indisponível; não ocorre reenvio automático |
+| 27. Administração | Relatórios, XLSX, reprocessamento e exclusão local funcionando |
+| 28. Health check | /healthz retorna 200 sem dados sensíveis |
+| 29. Bronze | Engenharia confirma ingestão e nulos do contrato de origem painel |
 
-1. Execute `instalar.ps1` e `scripts\configurar_seguranca.ps1`.
-2. Configure a chave Gemini no `.env`.
-3. Inicie com `iniciar.ps1` e conecte a extensao por codigo temporario.
-4. Execute `scripts\executar_testes.ps1`; todos os testes devem passar.
-5. Execute `scripts\backup.ps1` e confirme a criacao do ZIP em `backups`.
+O caso 25 é validado também por teste automatizado com dois bancos independentes. Em ambiente real, realize-o de forma planejada após registrar o que está pendente; não apague o banco em uso apenas para testar.
 
-## Cenarios obrigatorios
+Os casos de indisponibilidade/429/falha de integridade são cobertos offline pela suíte. Não provoque consumo artificial da quota real. Para testar falha de entrega no ambiente, use uma configuração controlada e depois restaure-a, preservando a chave interna e os usuários.
 
-- Imagem de atestado valida: deve chegar como pendente.
-- PDF de atestado valido: deve chegar como pendente.
-- Receita ou foto comum: deve ser ignorada e registrada no log.
-- Mesmo arquivo duas vezes: deve ser classificado como duplicado.
-- Conversas nao lidas em diferentes posicoes: todas devem ser percorridas.
-- Uma conversa sem anexo: deve ser ignorada e a fila deve continuar.
-- Botao parar: deve interromper a tarefa.
-- Limite 429 do Gemini: deve pausar e preservar o item na fila.
-- Revisao: aprovar e rejeitar, confirmando o nome do analista no historico.
-- Antes da aprovacao: confirmar que nada foi gravado no Volume.
-- Depois de **Aprovar e salvar**: confirmar documento e JSON no Volume com os dados revisados.
-- Depois de rejeitar: confirmar que nada foi enviado ao Volume.
-- Exportacao XLSX: conferir totais e campos aprovados.
-- Fechar o popup: o monitor deve continuar com a aba do WhatsApp aberta.
-- Revogar a extensao: novos uploads devem ser recusados ate novo pareamento.
-
-## Extracao manual oficial
-
-Enquanto o WhatsApp estiver indisponivel, acesse **Extracao Manual** no painel,
-selecione um PDF, JPG ou PNG e informe a unidade. O documento passa pelo Gemini
-e entra no mesmo painel oficial para revisao.
-
-## Criterio para aprovar o piloto
-
-- Nenhum documento perdido.
-- Nenhum arquivo nao-atestado registrado como aprovado sem revisao humana.
-- Duplicidades identificadas.
-- Backup criado e restaurado em uma copia de homologacao.
-- Todos os erros possuem registro suficiente para diagnostico.
-
-Nao restaure um backup sobre o ambiente principal durante o piloto. Primeiro
-copie o projeto para homologacao e valide a restauracao nessa copia.
+A aprovação em modo fake permanece pendente e é exibida como simulação local. O piloto recusa aprovação nesse modo. A validação final requer DELIVERY_MODE=databricks e OAuth M2M.

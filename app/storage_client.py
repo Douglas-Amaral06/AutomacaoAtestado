@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import base64
+import re
+import subprocess
 import threading
 import time
 import uuid
@@ -248,3 +250,62 @@ class DatabricksStorageClient:
             if attempt + 1 < self.max_attempts:
                 time.sleep(min(2**attempt, 4))
         raise RuntimeError("Falha na comunicação com a Files API do Databricks.") from last_error
+
+
+class DatabricksCliStorageClient(DatabricksStorageClient):
+    """Files API usando OAuth U2M guardado pela CLI, somente em desenvolvimento local."""
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        volume_root: str,
+        cli_path: str,
+        profile: str,
+        timeout_seconds: int = 60,
+        max_attempts: int = 3,
+    ) -> None:
+        self.cli_path = Path(cli_path).expanduser().resolve()
+        self.profile = profile.strip()
+        if not self.cli_path.is_file() or self.cli_path.name.lower() not in {"databricks", "databricks.exe"}:
+            raise ValueError("DATABRICKS_CLI_PATH deve apontar para a CLI oficial instalada.")
+        if not self.profile or not re.fullmatch(r"[A-Za-z0-9_.-]+", self.profile):
+            raise ValueError("DATABRICKS_CLI_PROFILE inválido.")
+        super().__init__(
+            host=host,
+            client_id="u2m-local",
+            client_secret="u2m-local",
+            volume_root=volume_root,
+            timeout_seconds=timeout_seconds,
+            max_attempts=max_attempts,
+        )
+
+    def _token(self, *, force_refresh: bool = False) -> str:
+        with self._token_lock:
+            if not force_refresh and self._access_token and time.time() < self._token_expires_at - 120:
+                return self._access_token
+            try:
+                completed = subprocess.run(
+                    [str(self.cli_path), "auth", "token", "--profile", self.profile],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=self.timeout_seconds,
+                    check=False,
+                    shell=False,
+                )
+            except (OSError, subprocess.SubprocessError) as error:
+                raise RuntimeError("Falha ao obter a sessão local do Databricks.") from error
+            if completed.returncode != 0:
+                raise RuntimeError("Sessão local do Databricks expirada. Renove o login corporativo.")
+            try:
+                payload = json.loads(completed.stdout)
+            except (TypeError, ValueError) as error:
+                raise RuntimeError("A CLI do Databricks retornou uma sessão inválida.") from error
+            token = payload.get("access_token")
+            if not isinstance(token, str) or not token:
+                raise RuntimeError("A CLI do Databricks não retornou uma sessão válida.")
+            self._access_token = token
+            self._token_expires_at = time.time() + 45 * 60
+            return token

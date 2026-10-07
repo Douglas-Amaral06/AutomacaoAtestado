@@ -32,14 +32,11 @@ def homologar(destino: Path = DEFAULT_OUTPUT) -> tuple[Path, Path, dict]:
         document_content=content,
         original_name="atestado-homologacao-ficticio.pdf",
         mime="application/pdf",
-        unidade="UNI001",
+        unidade="TESTE",
+        polo="ZZ",
+        teste=True,
         data_recebimento=received_at,
-        origem={
-            "id_mensagem": f"messageId-HOMOLOGACAO-{received_at:%Y%m%d%H%M%S}",
-            "id_conversa": "5511999990000@c.us",
-            "whatsapp_remetente": "+5511999990000",
-            "whatsapp_destinatario": "+5511988887777",
-        },
+        origem={"operador_id": "opr_" + "0" * 32},  # Identidade sintética de homologação.
         extracao={
             "motor": "HOMOLOGACAO-LOCAL",
             "versao": "1.0",

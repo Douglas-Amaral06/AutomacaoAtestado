@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Acompanhar envio{% endblock %}
+{% block page_title %}Acompanhar envio{% endblock %}
+{% block content %}
+<div class="card" style="max-width:760px">
+  <h1 class="page-title">Envio #{{ item.id }}</h1>
+  <p>{{ item.arquivo_original }}</p>
+  {% if duplicate %}<div class="alert" role="status">Possível documento repetido. O reenvio foi aceito para conferência.</div>{% endif %}
+  {% if item.atestado_id %}
+    <h2>Extração concluída</h2><p>Documento enviado para revisão. Confira os dados antes de aprovar.</p>
+    <a class="btn btn-primary" href="/atestados/{{ item.atestado_id }}">Revisar documento</a>
+  {% elif item.status == 'ignorado' %}
+    <h2>Documento não reconhecido</h2><p>O arquivo não foi reconhecido como atestado ou comprovante de horas. Confira o documento e envie novamente.</p>
+  {% elif item.status in ['falhou','pausado_quota'] or item.erro_amigavel %}
+    <h2>{{ 'Limite temporário da IA' if item.status == 'pausado_quota' else 'Falha temporária na leitura' }}</h2>
+    <p>{{ item.erro_amigavel or 'O arquivo foi preservado. Solicite ao administrador uma nova tentativa pelo painel.' }}</p>
+    {% if item.status == 'aguardando_retentativa' %}<p data-refresh-upload>Uma nova tentativa está programada.</p>{% endif %}
+  {% else %}
+    <h2 data-refresh-upload>Processando documento</h2><p role="status">Arquivo validado. A leitura está na fila ou em andamento. Esta página será atualizada automaticamente.</p>
+  {% endif %}
+  <div style="margin-top:var(--space-5)"><a class="btn btn-secondary" href="/">Voltar ao painel</a> <a class="btn btn-ghost" href="/atestados/novo">Enviar outro atestado</a></div>
+</div>
+{% endblock %}
+{% block extra_js %}<script src="{{ url_for('static', path='/js/upload.js').path }}"></script>{% endblock %}

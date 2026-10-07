@@ -90,13 +90,6 @@ def validation_summary(record, today: date | None = None) -> dict:
     if kind == "atestado_medico" and days is None:
         errors.append("Dias de afastamento é obrigatório para Atestado Médico.")
 
-    enrichment = str(record.get("status_enriquecimento") or "")
-    if enrichment in {"NAO_ENCONTRADO", "REVISAR_DUPLICIDADE"}:
-        errors.append("Nome não localizado de forma única na Base Geral.")
-    elif enrichment == "BASE_NAO_CONFIGURADA":
-        warnings.append("Base Geral não configurada; não foi possível localizar o nome.")
-    elif enrichment == "DADOS_INSUFICIENTES":
-        warnings.append("Dados insuficientes para localizar o nome na Base Geral.")
     if record.get("possivel_repeticao"):
         warnings.append("Possível documento repetido. Confira o histórico antes de aprovar; o reenvio não foi bloqueado.")
 

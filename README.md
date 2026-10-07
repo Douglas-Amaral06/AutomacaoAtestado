@@ -1,307 +1,154 @@
-# Recebimento de Atestados - MVP
+# Automação de Atestados
 
-MVP local para capturar manualmente um atestado aberto no WhatsApp Web, extrair
-campos com a API Gemini, salvar em SQLite e permitir conferencia humana antes
-da exportacao para XLSX.
+Aplicação interna para recebimento, extração assistida por IA, revisão humana e entrega de atestados ao Databricks.
 
-## Estrutura do projeto
+**Analista → Painel FastAPI → Upload → Validação → Gemini → Revisão humana → Databricks Volume/Bronze.**
 
-- `app`: servidor, seguranca, banco e interface web.
-- `extension`: extensao do Chrome/Edge.
-- `scripts`: administracao, backup, atualizacao e testes.
-- `tests`: testes automatizados de seguranca e fluxo.
-- `docs`: roteiro de homologacao.
-- `data` e `backups`: dados locais ignorados pelo Git.
+O painel é a única entrada operacional. Python, FastAPI, Jinja2 e SQLite foram preservados. O prompt de extração Gemini e os clientes de storage homologados continuam sendo usados.
 
-## Fluxo
+## Instalação local
 
-1. WhatsApp Business aberto e logado no navegador.
-2. O analista abre a mensagem que contem o atestado.
-3. A extensao e ativada e o arquivo e selecionado.
-4. O servidor local recebe o arquivo.
-5. O Gemini extrai os dados.
-6. Os dados ficam armazenados no SQLite.
-7. O analista revisa e confirma no painel local.
-
-## Requisitos
-
-- `uv` (gerenciador gratuito de Python; ja disponivel neste computador).
-- Chave da API Gemini.
-- Google Chrome ou Microsoft Edge.
-
-## Instalacao do servidor
-
-Instalacao automatizada recomendada:
+Python 3.12 (a suíte foi executada com 3.12.14). No Windows:
 
 ```powershell
-.\instalar.ps1
-.\scripts\configurar_seguranca.ps1
-```
-
-Instalacao manual:
-
-```powershell
-uv venv --python 3.12
-uv pip install --python .venv\Scripts\python.exe -r requirements.txt
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
 Copy-Item .env.example .env
-```
-
-Abra o arquivo `.env` e cole a chave depois do sinal de igual:
-
-```env
-GEMINI_API_KEY=sua_chave_aqui
-GEMINI_MODEL=gemini-2.5-flash
-PROCESSOR_CONTRACT_APPROVED=false
-PROCESSOR_REGION=configure_a_regiao_aprovada
-GEMINI_TIMEOUT_SECONDS=60
-GEMINI_MAX_ATTEMPTS=2
-GEMINI_MAX_OUTPUT_TOKENS=1024
-GEMINI_MAX_DOCUMENT_MB=8
-GEMINI_DAILY_REQUEST_LIMIT=50
-GEMINI_DAILY_OUTPUT_TOKEN_BUDGET=50000
-```
-
-O envio de documentos ao Gemini permanece bloqueado enquanto
-`PROCESSOR_CONTRACT_APPROVED` nao for alterado para `true` por uma pessoa
-autorizada e `PROCESSOR_REGION` nao declarar a regiao aprovada. Essa declaracao
-de configuracao nao substitui a verificacao contratual nem, por si so, altera o
-endpoint ou garante residencia regional no provedor.
-
-O orcamento local do Gemini e conservador: cada tentativa reserva o teto de
-tokens de saida antes da chamada, mesmo quando a resposta real for menor. Isso
-evita que retries ou varias extensoes ultrapassem silenciosamente o limite
-diario. Ajuste os valores somente depois de conferir a cota da conta usada.
-
-Nao use aspas nem espacos ao redor do sinal de igual. Depois execute:
-
-```powershell
+.\scripts\configurar_seguranca.ps1
 .\iniciar.ps1
 ```
 
-Se o PowerShell bloquear o script, execute diretamente:
+O script de segurança gera uma chave em `.env`, se necessário, e solicita uma senha de administrador sem exibi-la. Alternativamente, configure `APP_SECRET_KEY` com pelo menos 32 caracteres aleatórios e `BOOTSTRAP_USERS_JSON`, descrito abaixo. Não substitua um `.env` existente. Acesse http://127.0.0.1:8000.
 
-```powershell
-.venv\Scripts\uvicorn.exe app.main:app --host 127.0.0.1 --port 8000 --reload --no-proxy-headers
+No Linux: crie o ambiente com `python -m venv .venv`, instale `requirements.txt`, configure `.env` e execute `uvicorn app.main:app --host 127.0.0.1 --port 8000`.
+
+Sem credenciais, `DELIVERY_MODE=disabled` permite desenvolver o painel e revisar. Uma aprovação nunca vira confirmação com a entrega desabilitada. A leitura depende de `GEMINI_API_KEY`, `PROCESSOR_CONTRACT_APPROVED=true` e `PROCESSOR_REGION` aprovada. O sistema não altera esses valores automaticamente.
+
+## Usuários do piloto e recuperação após redeploy
+
+Cadastre `BOOTSTRAP_USERS_JSON` como variável secreta no Render. Exemplo estrutural, com valores a substituir no ambiente (não versionar senhas):
+
+```json
+[
+  {"usuario":"admin","nome":"Administrador","perfil":"admin","senha":"SUBSTITUIR_POR_SEGREDO_FORTE"},
+  {"usuario":"analista01","nome":"Analista 01","perfil":"analista","senha":"SUBSTITUIR_POR_OUTRO_SEGREDO"}
+]
 ```
 
-Abra `http://127.0.0.1:8000`.
+Cada senha deve ter de 12 a 256 caracteres. Usuários usam 3 a 50 letras ASCII, números, ponto, hífen ou sublinhado. O bootstrap normaliza o usuário para minúsculas, valida o conjunto antes da gravação e armazena somente Argon2id. Não registra ou exibe senhas. Contas existentes mantêm senha, perfil, estado ativo e identidade; alterar o JSON não redefine a conta em um banco já existente.
 
-## Instalacao da extensao
+O ID público tem formato `opr_<32 hex>` e é derivado de HMAC-SHA256 de `operador:<usuario>` com `APP_SECRET_KEY`. **Preserve a mesma chave, o mesmo usuário e os segredos no Render entre deploys.** A chave é gerada pelo Blueprint no primeiro provisionamento; ao recriar o serviço, restaure o mesmo valor do gerenciador de segredos.
 
-1. Acesse `chrome://extensions` ou `edge://extensions`.
-2. Ative o modo de desenvolvedor.
-3. Clique em **Carregar sem compactacao**.
-4. Selecione a pasta `extension` deste projeto.
-5. Abra a conversa no WhatsApp Web, clique na extensao e escolha o arquivo.
+Também é aceito `operador_public_id` explícito. Para transportar identidades de usuários anteriores ao bootstrap, copie os IDs exibidos em **Usuários** para esse campo no JSON. Isso preserva o vínculo com entregas históricas, sem trocar IDs já cadastrados. IDs devem ser únicos. Contas criadas apenas pelo painel desaparecem se o SQLite for perdido: inclua os usuários necessários no bootstrap. O piloto exige ao menos um administrador ativo na inicialização.
 
-## Teste do monitoramento automatico
+Administrador: revisão, upload, exclusão local, reprocessamento, exportação e relatórios. Analista: revisão e upload. Os dois usam sessão e CSRF; a identidade de envio vem exclusivamente da sessão.
 
-1. Inicie o servidor com `.\iniciar.ps1`.
-2. Em `chrome://extensions`, clique em **Atualizar** no cartao da extensao.
-3. Atualize a pagina do WhatsApp Web.
-4. Abra a conversa que sera monitorada.
-5. Abra a extensao e ative **Monitoramento automatico**.
-6. Aguarde aparecer `Monitorando: nome da conversa`.
-7. Envie de outro telefone uma nova imagem de atestado para essa conversa.
-8. Aguarde o selo `OK` no icone da extensao e confira o registro no painel.
+## Upload e revisão
 
-Se o anexo chegou antes de o monitoramento ser ativado, clique em **Processar
-ultimo anexo da conversa**. O botao **Enviar arquivo selecionado** continua
-sendo exclusivo para arquivos baixados manualmente.
+1. Faça login, clique **Enviar atestado** e selecione PDF, JPG/JPEG ou PNG.
+2. Confira nome e tamanho; troque ou remova a seleção antes de enviar.
+3. O backend confere tamanho, MIME, assinatura binária e estrutura. PDFs protegidos/corrompidos e imagens inválidas são recusados. O limite de upload é 15 MB; o limite de leitura Gemini é independente (8 MB por padrão). Imagens têm limite de 40 milhões de pixels para decodificação segura.
+4. O original é salvo com UUID e SHA-256, junto do horário `America/Sao_Paulo`, usuário, origem `painel` e destino configurado `AUREA / SP`. O navegador não escolhe esses metadados.
+5. A página de acompanhamento mostra fila, leitura, conclusão, documento não reconhecido ou falha. A leitura começa em segundo plano; o worker recupera itens pendentes a cada 20 segundos. Quotas e erros temporários preservam o arquivo. Administradores podem retomar ou reprocessar itens com falha.
+6. Na revisão, confira original, nome, CPF, CID, data, dias, CRM/CRO, UF, assinatura, carimbo, observações e aviso INSS. Arquivos de mesmo SHA são aceitos e sinalizados como possível repetição.
+7. **Aprovar e salvar** persiste as correções, reserva a revisão, valida o contrato, grava o original, relê o SHA e grava o JSON. Só a entrega real concluída produz `confirmado / entregue_volume` e exibe o ID Databricks.
+8. **Rejeitar**, com motivo, não chama Databricks. Em falha de entrega, o registro continua pendente, com correções salvas e mensagem segura para nova tentativa.
 
-O monitoramento atual cobre novas imagens e PDFs expostos pelo WhatsApp Web na
-conversa aberta. Anexos antigos sao ignorados. Ao trocar de conversa, o
-monitoramento pausa e precisa ser ativado novamente. O envio manual permanece
-disponivel como contingencia.
+Uma reserva bloqueia revisões e exclusões concorrentes durante a entrega. Reservas interrompidas podem ser retomadas após 30 minutos, reabrindo e aprovando novamente. Um confirmado não é reenviado automaticamente, mesmo se o original local desaparecer. Exclusão pelo painel remove apenas o registro/arquivo local, nunca arquivos do Volume ou linhas Bronze.
 
-### Monitoramento de varias conversas
+`/exportar.xlsx` permanece disponível ao administrador, gerado em memória e protegido contra fórmulas injetadas. Os campos matrícula, telefone, e-mail e empresa existentes são preservados quando ausentes do formulário; nenhuma planilha local é necessária.
 
-O modo **Monitorar conversas nao lidas** percorre as conversas com contador de
-nao lidas, abre cada uma e verifica o ultimo anexo. Ele altera a conversa
-visivel no WhatsApp Web enquanto trabalha, portanto deve ser usado quando o
-analista nao estiver navegando manualmente. Arquivos repetidos sao detectados
-pelo hash e imagens que nao forem atestados sao ignoradas pelo Gemini.
+## Render
 
-O andamento aparece em um painel no canto inferior direito do WhatsApp Web.
-Fechar o popup da extensao nao encerra o monitoramento; a aba do WhatsApp deve
-permanecer aberta. O navegador pode estar minimizado.
+Crie um **Blueprint** a partir deste repositório usando `render.yaml`. Ele define um Web Service Python, sem disco persistente, banco externo ou infraestrutura adicional. Configure os segredos solicitados antes de criar o serviço e preserve-os entre deploys.
 
-O botao **Parar tarefa** interrompe todos os modos. Os eventos ficam registrados
-em `http://127.0.0.1:8000/logs`, incluindo tentativas de abertura, conversas sem
-anexo, erros, arquivos ignorados, duplicidades e atestados salvos.
+- Build Command: `pip install -r requirements.txt`
+- Start Command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- Health Check Path: `/healthz` → `{"status":"ok"}` sem autenticação.
+- Uma instância e um processo Uvicorn. Não usar `--reload` nem aumentar workers: SQLite e limites por usuário são locais ao processo.
+- Após obter a URL, prefira restringir `ALLOWED_HOSTS` ao hostname exato do serviço; adicione o domínio próprio, se houver. O Blueprint permite `127.0.0.1,localhost,*.onrender.com` para o primeiro deploy.
 
-Para abrir as conversas automaticamente, a extensao usa temporariamente a
-permissao de depuracao do Chrome para produzir um clique real. O Chrome pode
-exibir um aviso de permissao ao atualizar a extensao. A conexao de depuracao e
-encerrada imediatamente depois de cada clique.
+O TLS termina no proxy Render. `COOKIE_SECURE=true` garante cookies Secure mesmo quando a conexão interna usa HTTP; os links de assets e redirecionamentos são relativos. O comando mantém a confiança restrita de proxy do Uvicorn, sem `--forwarded-allow-ips=*`. Cabeçalhos Cloudflare não são usados. Quando o IP público não é fornecido por um proxy confiável, o bloqueio global de login pode agrupar conexões pelo IP do proxy, de forma conservadora; o bloqueio por conta continua ativo. Não amplie a confiança em cabeçalhos enviados pelo cliente para contornar isso.
 
-Ao receber `429 RESOURCE_EXHAUSTED` do Gemini, a tarefa inteira e pausada e os
-dois modos de monitoramento sao desligados. O painel e o log mostram o tempo de
-espera informado pela API, quando disponivel. O analista deve reativar a tarefa
-depois desse periodo.
+Referências de configuração: [FastAPI no Render](https://render.com/docs/deploy-fastapi), [Blueprint](https://render.com/docs/blueprint-spec), [versão Python](https://render.com/docs/python-version).
 
-## Primeira configuracao segura
+### Variáveis exatas do Blueprint
 
-Depois de instalar as dependencias, execute uma unica vez:
+| Variável | Valor no Render |
+|---|---|
+| `PYTHON_VERSION` | `3.12.14` |
+| `APP_ENV` | `pilot` |
+| `APP_SECRET_KEY` | Segredo aleatório persistente; gerado no primeiro provisionamento |
+| `BOOTSTRAP_USERS_JSON` | JSON secreto com administrador e analistas |
+| `DATA_DIR` | `/tmp/atestados` |
+| `ALLOWED_HOSTS` | `127.0.0.1,localhost,*.onrender.com`; depois hostname exato |
+| `COOKIE_SECURE` | `true` |
+| `TRUST_CLOUDFLARE` | `false` |
+| `LOCAL_BACKUP_ENABLED` | `false` |
+| `GEMINI_API_KEY` | Segredo da API |
+| `GEMINI_MODEL` | `gemini-2.5-flash` |
+| `PROCESSOR_CONTRACT_APPROVED` | `true` somente com aprovação organizacional existente |
+| `PROCESSOR_REGION` | Identificador da região aprovada; não é configurada pela aplicação |
+| `GEMINI_TIMEOUT_SECONDS` | `60` |
+| `GEMINI_MAX_ATTEMPTS` | `2` |
+| `GEMINI_MAX_OUTPUT_TOKENS` | `1024` |
+| `GEMINI_MAX_DOCUMENT_MB` | `8` |
+| `GEMINI_DAILY_REQUEST_LIMIT` | `50` |
+| `GEMINI_DAILY_OUTPUT_TOKEN_BUDGET` | `50000` |
+| `UPLOAD_RATE_LIMIT_PER_HOUR` | `30`, por usuário |
+| `UPLOAD_DAILY_QUOTA_MB` | `300`, por usuário |
+| `DELIVERY_MODE` | `databricks` |
+| `DELIVERY_UNIT` | `AUREA` |
+| `DELIVERY_POLO` | `SP` |
+| `DELIVERY_TEST` | `false` |
+| `DATABRICKS_UPLOAD_ENABLED` | `true` |
+| `DATABRICKS_HOST` | URL HTTPS do workspace autorizado |
+| `DATABRICKS_VOLUME_ROOT` | `/Volumes/renapsi_prd/bronze_atestados/atestado` |
+| `DATABRICKS_AUTH_MODE` | `m2m` |
+| `DATABRICKS_CLIENT_ID` | Identidade da Service Principal |
+| `DATABRICKS_CLIENT_SECRET` | Segredo OAuth M2M |
+| `DATABRICKS_TIMEOUT_SECONDS` | `60` |
+| `DATABRICKS_MAX_ATTEMPTS` | `3` |
 
-```powershell
-.\scripts\configurar_seguranca.ps1
-```
+`PORT` é fornecida pelo Render. As demais opções locais estão em `.env.example`. `GEMINI_MIN_INTERVAL_SECONDS=13`, `GEMINI_IMAGE_ENHANCEMENT=true` e retenção desabilitada continuam como padrões; não é necessário configurá-las no Render. O piloto não usa CLI/U2M.
 
-O comando gera a chave interna e solicita os dados do administrador. O acesso
-ao painel utiliza usuário e senha; a senha é armazenada somente como hash.
+### Limitações aceitas do piloto
 
-Para conectar a extensao, entre no painel como administrador, abra
-**Conectar extensao**, gere o codigo temporario de 6 digitos e informe-o na
-extensao. O codigo expira em 10 minutos e funciona uma unica vez. A credencial
-definitiva expira em 90 dias e fica armazenada no servidor somente como hash.
+SQLite e uploads são temporários: podem desaparecer em redeploy/reconstrução/restart com perda do filesystem. Documentos ainda não confirmados podem exigir novo envio. Documentos confirmados permanecem no Databricks, que é a persistência oficial. O painel não reconstrói automaticamente seu histórico a partir do Volume. Reiniciar o processo também reinicia os limites de upload em memória; perder SQLite reinicia o orçamento local Gemini.
 
-Consulte `SECURITY.md` antes de publicar com Cloudflare.
+Backups ZIP automáticos não são iniciados com `LOCAL_BACKUP_ENABLED=false`. Scripts de backup/restore permanecem para uso local, com verificação de hashes e proteção de caminhos. Se configurou `DATA_DIR` personalizado, confira o destino do restore local antes de executá-lo.
 
-## Enriquecimento automatico
+## Banco e migração
 
-Configure uma unica vez os dois arquivos locais sem colocar caminhos no codigo:
+Inicialização idempotente, executada no startup. A fila é reconstruída dentro de uma transação com preservação dos IDs, vínculos, hashes, arquivos, tentativas, horários, dono e leases; apenas as colunas operacionais são copiadas. Atestados e contas não são apagados. A unicidade do SHA foi removida. Índices operacionais ficam em status/disponibilidade e hash. Metadados de identidade do canal anterior são convertidos quando presentes; tabelas antigas de autenticação do canal são eliminadas somente após a cópia. Os campos antigos não usados da tabela de usuários podem permanecer sem dependência de runtime.
 
-```powershell
-.venv\Scripts\python.exe scripts\configurar_pipeline.py --atestados "caminho-local.xlsx" --base-geral "caminho-local.xlsx"
-```
+A fila atual contém `id`, `arquivo_hash`, `arquivo_original`, `arquivo_salvo`, `mime_type`, `status`, `tentativas`, `ultimo_erro`, `erro_amigavel`, `disponivel_em`, `atestado_id`, `criado_em`, `atualizado_em`, `data_recebimento`, `unidade`, `polo`, `origem`, `operador_id`, `lock_token`, `lock_expires_em`.
 
-Os caminhos ficam somente no `.env`, que nao entra no Git. Em cada recebimento,
-o Gemini extrai os dados do documento e o sistema
-localiza a pessoa na Base Geral por CPF + nome e acrescenta uma linha completa
-na planilha de atestados configurada. A gravacao usa arquivo temporario e troca
-atomica para reduzir risco de corrupcao. Mantenha a planilha fechada no Excel
-durante o processamento; se estiver bloqueada, o item permanece na fila para
-nova tentativa. Um identificador tecnico oculto impede linhas duplicadas. Nao
-existe execucao manual no painel: esse cruzamento e parte obrigatoria do fluxo.
+Antes de migrar uma instalação local com dados úteis, encerre a versão anterior e gere um backup local. Não há migração destrutiva de atestados nem chamadas externas na inicialização. Nenhum banco real foi necessário para testar a migração.
 
-## Leitura de imagens de documentos
+## Databricks e validação
 
-Para imagens JPG, PNG e WEBP, o sistema envia ao motor a foto original e uma
-copia auxiliar em memoria com orientacao EXIF corrigida, contraste moderado e
-nitidez leve. O arquivo original salvo nunca e modificado e continua sendo a
-fonte do SHA-256. A extracao tambem identifica CRM/CRO, UF, assinatura e carimbo;
-quando a qualidade nao permite certeza, o valor permanece nulo para revisao
-humana. Para desativar somente a copia auxiliar, use:
-
-```env
-GEMINI_IMAGE_ENHANCEMENT=false
-```
-
-## Backup, retencao e atualizacao
-
-Enquanto o servidor estiver ativo, um backup verificado e criado a cada 24
-horas em `backups`. Para criar um imediatamente, execute
-`scripts\backup.ps1`. Para executar backup, retencao e limpeza de backups
-antigos, use `scripts\manutencao.ps1`.
-
-A exclusao por retencao vem desativada. Depois da aprovacao de RH, juridico e
-LGPD, defina `RETENTION_ENABLED=true` no `.env` e ajuste
-`DOCUMENT_RETENTION_DAYS`. Somente documentos ja confirmados ou rejeitados e
-vencidos sao removidos; pendencias nao sao apagadas. Os backups permanecem pelo
-prazo independente de `BACKUP_RETENTION_DAYS`.
-
-Para atualizar dependencias e validar o projeto, execute
-`scripts\atualizar.ps1`. Esse
-script cria backup antes da atualizacao e roda toda a suite de testes. A
-restauracao usa `scripts\restaurar_backup.ps1 -Arquivo caminho-do-zip` e exige o
-servidor parado.
-
-O roteiro completo de homologacao esta em `docs\PILOTO.md`.
-As decisoes, pendencias da secao 13 e etapas especificas do Databricks estao em
-`docs\INTEGRACAO_DATABRICKS_V2.md`.
-
-## Endereco do backend na extensao
-
-A extensao usa `http://127.0.0.1:8000` por padrao para desenvolvimento local.
-O campo **Endereco do backend** no popup permite apontar futuramente para um
-servidor central. Enderecos remotos aceitam somente HTTPS e o Chrome solicita
-permissao apenas para o host informado. Ao trocar o servidor, o token anterior e
-removido e um novo pareamento passa a ser obrigatorio.
-
-## Custos
-
-SQLite e a geracao de XLSX sao locais e gratuitas. O projeto nao depende da
-API do Google Sheets nem do Microsoft Graph. O unico servico externo do MVP e
-a API Gemini ja disponibilizada pela empresa.
-
-## Preparacao da entrega Databricks
-
-A entrega segue desacoplada por `DeliveryService -> StorageClient`. O modo
-padrao permanece desabilitado. O `DatabricksStorageClient` implementa a Files
-API e OAuth M2M da especificacao v2, mas nenhuma chamada real ocorre enquanto
-a ativacao dupla abaixo nao for configurada explicitamente.
-
-Antes de qualquer escrita, a entrega valida integralmente o contrato v2: chaves,
-tipos, datas com fuso, telefones E.164, CPF, CRM/UF, CID, caminhos, tamanho e
-SHA-256. Qualquer divergencia interrompe a operacao antes de gravar o documento.
-
-Para homologar localmente o fluxo completo com documentos exclusivamente
-ficticios, configure no `.env`:
-
-```env
-DELIVERY_MODE=fake
-DELIVERY_FAKE_ROOT=C:\caminho\seguro\para\homologacao
-DELIVERY_UNIT=UNI001
-DELIVERY_WHATSAPP_DESTINATION=+5511988887777
-```
-
-No modo `fake`, cada atestado reconhecido pelo fluxo normal gera o documento
-original e o JSON contratual lado a lado no diretorio informado. O documento e
-gravado e relido para validar o SHA-256 antes da criacao do JSON. Para desligar:
-
-```env
-DELIVERY_MODE=disabled
-```
-
-O modo real preparado usa o destino oficial
-`/Volumes/renapsi_prd/bronze_atestados/atestado`, cria a pasta, grava o documento,
-confirma a integridade e somente entao grava o JSON. As credenciais nunca ficam
-no codigo. Quando o engenheiro fornecer valores ficticios/de homologacao, a
-configuracao sera:
-
-```env
-DELIVERY_MODE=databricks
-DATABRICKS_UPLOAD_ENABLED=true
-DATABRICKS_HOST=https://dbc-32044e02-fb27.cloud.databricks.com
-DATABRICKS_VOLUME_ROOT=/Volumes/renapsi_prd/bronze_atestados/atestado
-DATABRICKS_CLIENT_ID=configure_externamente
-DATABRICKS_CLIENT_SECRET=configure_externamente
-```
-
-Definir apenas `DELIVERY_MODE=databricks` nao basta: sem
-`DATABRICKS_UPLOAD_ENABLED=true`, o sistema falha fechado antes de abrir qualquer
-conexao. Ate a homologacao controlada, mantenha `DELIVERY_MODE=fake` ou
-`disabled` e `DATABRICKS_UPLOAD_ENABLED=false`.
-
-Depois de receber as credenciais, a primeira verificacao pode ser somente
-leitura (autentica e lista o Volume, sem gravar arquivos):
-
-```powershell
-.venv\Scripts\python.exe scripts\homologar_databricks.py --check-access
-```
-
-O primeiro upload deve usar somente dados sinteticos e exige tanto a chave de
-ambiente quanto a confirmacao literal do destino:
-
-```powershell
-.venv\Scripts\python.exe scripts\homologar_databricks.py --upload-fictitious --confirm-volume "/Volumes/renapsi_prd/bronze_atestados/atestado"
-```
-
-Esse comando nao deve ser executado antes de o engenheiro confirmar se o destino
-e de homologacao ou producao.
-
-Limitacao conhecida antes da ativacao real: o fluxo operacional atual bloqueia
-somente a repeticao da mesma mensagem pelo `id_mensagem`. O mesmo binario
-recebido em mensagens diferentes e preservado como eventos historicos distintos,
-conforme o contrato Bronze. Uploads manuais sem identificador tambem sao tratados
-como novas ocorrencias.
-
-Para executar uma homologacao isolada, somente com dados ficticios:
+Consulte [contrato e homologação](docs/INTEGRACAO_DATABRICKS_V2.md) e o [roteiro completo do piloto](docs/PILOTO.md).
 
 ```powershell
 .venv\Scripts\python.exe scripts\homologar_entrega_fake.py
+.venv\Scripts\python.exe scripts\homologar_databricks.py --check-config
+.venv\Scripts\python.exe scripts\homologar_databricks.py --check-access
 ```
 
-O comando grava um PDF sintetico e seu JSON em `data\homologacao_fake`, confirma
-o pareamento dos nomes e recalcula o SHA-256. Nenhum acesso de rede e realizado.
+O primeiro usa somente storage local fictício. O segundo valida configuração sem rede. O terceiro autentica e lê o Volume, sem gravar. A homologação real pelo painel deve conferir o par, hash, operador, destino e ingestão Bronze. O estado `entregue_volume` confirma a entrega ao Volume; não consulta a conclusão da ingestão Bronze.
+
+## Segurança e testes
+
+Argon2id, sessões por hash, cookies HttpOnly/SameSite/Secure, CSRF, permissões, TrustedHost, CSP, proteção de login, limites de upload, validação de bytes/estrutura e logs sanitizados foram mantidos. Não há CORS permissivo. Dados e segredos locais estão excluídos do Git. Consulte [SECURITY.md](SECURITY.md).
+
+```powershell
+.venv\Scripts\python.exe -m compileall app
+.venv\Scripts\python.exe -m pytest -q
+```
+
+Testes usam bancos temporários, extração simulada e storage local ou transporte HTTP substituído. Não acessam Gemini nem Databricks reais. As duas bases CSV sintéticas em `data/fixtures` alimentam o simulador Databricks; saídas geradas são ignoradas pelo Git.
+
+## Próxima fase: integração Fluig
+
+Após validar o piloto: um atestado entregue poderá originar uma tarefa Fluig, com ID, status e data de criação. Nenhum endpoint, mock ou campo de tarefa foi adicionado agora. A identidade interna e o serviço de ingresso são independentes de um futuro provedor corporativo de login.

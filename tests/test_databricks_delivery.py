@@ -17,8 +17,7 @@ from scripts.homologar_entrega_fake import homologar
 from scripts import homologar_databricks
 
 
-ID_PATTERN = re.compile(r"^UNI001_\d{8}T\d{6}_[0-9a-f]{8}$")
-E164_PATTERN = re.compile(r"^\+[1-9]\d{7,14}$")
+ID_PATTERN = re.compile(r"^ZZ_\d{8}T\d{6}_[0-9a-f]{8}$")
 TOP_LEVEL_KEYS = {"versao_schema", "id_documento", "origem", "arquivo", "extracao", "documento"}
 
 
@@ -48,17 +47,20 @@ def test_json_respeita_contrato_e_integridade(tmp_path):
     document_path, json_path, _ = simular_entregas(tmp_path)[0]
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert set(payload) == TOP_LEVEL_KEYS
-    assert payload["versao_schema"] == "1.0"
+    assert payload["versao_schema"] == "1.2"
     assert ID_PATTERN.fullmatch(payload["id_documento"])
     assert payload["id_documento"].endswith(payload["arquivo"]["sha256"][:8])
     assert sha256_bytes(document_path.read_bytes()) == payload["arquivo"]["sha256"]
     assert payload["arquivo"]["nome_armazenado"] == document_path.name
     assert payload["arquivo"]["extensao"] == "pdf"
     assert payload["arquivo"]["tamanho_bytes"] == document_path.stat().st_size
-    assert payload["arquivo"]["caminho"].startswith("/Volumes/renapsi_prd/bronze_atestados/atestado/UNI001/2026/08/21/")
-    assert E164_PATTERN.fullmatch(payload["origem"]["whatsapp_remetente"])
-    assert E164_PATTERN.fullmatch(payload["origem"]["whatsapp_destinatario"])
-    assert payload["origem"]["operador_id"] is None
+    assert payload["arquivo"]["caminho"].startswith("/Volumes/renapsi_prd/bronze_atestados/atestado/TESTE/ZZ/2026/08/21/")
+    assert payload["origem"]["unidade"] == "TESTE"
+    assert payload["origem"]["polo"] == "ZZ"
+    assert payload["origem"]["teste"] is True
+    assert payload["origem"]["whatsapp_remetente"] is None
+    assert payload["origem"]["whatsapp_destinatario"] is None
+    assert re.fullmatch(r"opr_[0-9a-f]{32}", payload["origem"]["operador_id"])
     received = datetime.fromisoformat(payload["origem"]["data_recebimento"])
     assert received.tzinfo is not None
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", payload["documento"]["data_emissao"])
@@ -138,7 +140,7 @@ def test_reenvio_do_mesmo_binario_cria_dois_registros_historicos(tmp_path):
     second = simulator.deliver(reenvio, start + timedelta(seconds=1))
     assert first[2]["arquivo"]["sha256"] == second[2]["arquivo"]["sha256"]
     assert first[2]["id_documento"] != second[2]["id_documento"]
-    assert first[2]["origem"]["id_mensagem"] != second[2]["origem"]["id_mensagem"]
+    assert first[2]["origem"]["id_mensagem"] is None
     assert first[0].is_file() and second[0].is_file()
 
 
@@ -156,7 +158,7 @@ def test_contrato_atual_colide_para_mesmo_binario_unidade_e_segundo(tmp_path):
     )
     assert first.payload["id_documento"] == second.payload["id_documento"]
     assert first.document_relative_path == second.document_relative_path
-    assert first.payload["origem"]["id_mensagem"] != second.payload["origem"]["id_mensagem"]
+    assert first.payload["origem"]["id_mensagem"] is None
 
 
 def test_preparador_real_mapeia_campos_e_nulos_do_contrato():
@@ -165,14 +167,11 @@ def test_preparador_real_mapeia_campos_e_nulos_do_contrato():
         document_content=content,
         original_name="atestado_001.pdf",
         mime="application/pdf",
-        unidade="uni001",
+        unidade="TESTE",
+        polo="ZZ",
+        teste=True,
         data_recebimento="2026-08-19T14:44:03Z",
-        origem={
-            "id_mensagem": "wamid.TESTE",
-            "id_conversa": "5511999990000@c.us",
-            "whatsapp_remetente": "+5511999990000",
-            "whatsapp_destinatario": "+5511988887777",
-        },
+        origem={"operador_id": "opr_" + "1" * 32},
         extracao={
             "motor": "google-gemini",
             "versao": "gemini-test",
@@ -196,7 +195,7 @@ def test_preparador_real_mapeia_campos_e_nulos_do_contrato():
     )
 
     payload = prepared.payload
-    assert payload["id_documento"].startswith("UNI001_20260819T114403_")
+    assert payload["id_documento"].startswith("ZZ_20260819T114403_")
     assert payload["origem"]["data_recebimento"] == "2026-08-19T11:44:03-03:00"
     assert payload["documento"]["cpf"] == "52998224725"
     assert payload["documento"]["crm"] is None
@@ -206,16 +205,15 @@ def test_preparador_real_mapeia_campos_e_nulos_do_contrato():
 
 
 def test_preparador_do_fluxo_real_nao_inventa_campos_ausentes(monkeypatch):
-    monkeypatch.setenv("DELIVERY_UNIT", "UNI001")
-    monkeypatch.setenv("DELIVERY_WHATSAPP_DESTINATION", "+5511988887777")
+    monkeypatch.setenv("DELIVERY_UNIT", "TESTE")
+    monkeypatch.setenv("DELIVERY_POLO", "ZZ")
+    monkeypatch.setenv("DELIVERY_TEST", "true")
     item = {
+        "operador_public_id": "opr_" + "1" * 32,
         "arquivo_original": "documento.jpeg",
         "mime_type": "image/jpeg",
         "data_recebimento": "2026-08-19T15:22:10-03:00",
         "criado_em": "2026-08-19 18:22:10",
-        "id_mensagem": "messageId-ficticio",
-        "id_conversa": None,
-        "whatsapp_remetente": None,
     }
     prepared = prepare_processed_delivery(item, {
         "tipo_documento": "atestado_medico",
@@ -234,7 +232,7 @@ def test_preparador_do_fluxo_real_nao_inventa_campos_ausentes(monkeypatch):
     assert prepared.payload["documento"]["cpf"] is None
     assert prepared.payload["documento"]["assinado"] is None
     assert prepared.payload["extracao"]["confianca_geral"] == 0.5
-    assert prepared.payload["origem"]["id_mensagem"] == "messageId-ficticio"
+    assert prepared.payload["origem"]["id_mensagem"] is None
 
 
 @pytest.mark.parametrize(
@@ -250,16 +248,15 @@ def test_preparador_do_fluxo_real_nao_inventa_campos_ausentes(monkeypatch):
 def test_entrega_separada_dos_dois_tipos_oficiais(
     tmp_path, monkeypatch, source_type, expected_type, days
 ):
-    monkeypatch.setenv("DELIVERY_UNIT", "UNI001")
-    monkeypatch.setenv("DELIVERY_WHATSAPP_DESTINATION", "+5511988887777")
+    monkeypatch.setenv("DELIVERY_UNIT", "TESTE")
+    monkeypatch.setenv("DELIVERY_POLO", "ZZ")
+    monkeypatch.setenv("DELIVERY_TEST", "true")
     item = {
+        "operador_public_id": "opr_" + "1" * 32,
         "arquivo_original": f"{source_type}.pdf",
         "mime_type": "application/pdf",
         "data_recebimento": "2026-08-19T15:22:10-03:00",
         "criado_em": "2026-08-19 18:22:10",
-        "id_mensagem": f"messageId-{source_type}",
-        "id_conversa": "conversa-ficticia",
-        "whatsapp_remetente": "+5511999990000",
     }
     extracted = {
         "tipo_documento": source_type,
@@ -283,7 +280,7 @@ def test_entrega_separada_dos_dois_tipos_oficiais(
     stored = json.loads(storage.path_for(prepared.json_relative_path).read_text(encoding="utf-8"))
     assert stored["documento"]["tipo_documento"] == expected_type
     assert stored["documento"]["dias_afastamento"] == days
-    assert stored["origem"]["id_mensagem"] == f"messageId-{source_type}"
+    assert stored["origem"]["id_mensagem"] is None
 
 
 def test_homologacao_fake_gera_par_verificado(tmp_path):
@@ -339,13 +336,11 @@ def test_databricks_client_usa_oauth_cache_e_files_api(monkeypatch):
         document_content=document,
         original_name="atestado.pdf",
         mime="application/pdf",
-        unidade="UNI001",
+        unidade="TESTE",
+        polo="ZZ",
+        teste=True,
         data_recebimento="2026-08-19T11:44:03-03:00",
-        origem={
-            "id_mensagem": "wamid.TESTE",
-            "whatsapp_remetente": "+5511999990000",
-            "whatsapp_destinatario": "+5511988887777",
-        },
+        origem={"operador_id": "opr_" + "1" * 32},
         extracao={"motor": "teste", "versao": "1", "data_extracao": "2026-08-19T11:44:04-03:00"},
         documento={},
     )
@@ -355,7 +350,7 @@ def test_databricks_client_usa_oauth_cache_e_files_api(monkeypatch):
     api_calls = [call for call in calls if "/api/2.0/fs/" in call[1]]
     assert len(token_calls) == 1
     assert [call[0] for call in api_calls] == ["PUT", "PUT", "GET", "PUT", "PUT"]
-    assert "/api/2.0/fs/directories/Volumes/renapsi_prd/bronze_atestados/atestado/UNI001/2026/08/19" in api_calls[0][1]
+    assert "/api/2.0/fs/directories/Volumes/renapsi_prd/bronze_atestados/atestado/TESTE/ZZ/2026/08/19" in api_calls[0][1]
     assert api_calls[1][1].endswith(".pdf?overwrite=true")
     assert api_calls[-1][1].endswith(".json?overwrite=true")
     assert api_calls[1][3] == document
@@ -487,6 +482,7 @@ def test_preflight_databricks_e_offline_e_nao_retorna_credenciais(monkeypatch):
     monkeypatch.setenv("DATABRICKS_VOLUME_ROOT", "/Volumes/renapsi_prd/bronze_atestados/atestado")
     monkeypatch.setenv("DATABRICKS_CLIENT_ID", client_id)
     monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", secret)
+    monkeypatch.setenv("DATABRICKS_AUTH_MODE", "m2m")
     monkeypatch.setenv("DATABRICKS_TEST_UNIT", "uni001")
     monkeypatch.setenv("DATABRICKS_UPLOAD_ENABLED", "false")
 
@@ -496,7 +492,8 @@ def test_preflight_databricks_e_offline_e_nao_retorna_credenciais(monkeypatch):
     assert result["configuracao_valida"] is True
     assert result["ambiente_inferido"] == "producao"
     assert result["upload_habilitado"] is False
-    assert result["unidade_teste"] == "UNI001"
+    assert result["unidade_teste"] == "TESTE"
+    assert result["polo_teste"] == "ZZ"
     assert secret not in rendered
     assert client_id not in rendered
 
@@ -506,6 +503,7 @@ def test_preflight_databricks_falha_fechado_com_placeholder(monkeypatch):
     monkeypatch.setenv("DATABRICKS_VOLUME_ROOT", "/Volumes/renapsi_prd/bronze_atestados/atestado")
     monkeypatch.setenv("DATABRICKS_CLIENT_ID", "configure_externamente")
     monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "")
+    monkeypatch.setenv("DATABRICKS_AUTH_MODE", "m2m")
     monkeypatch.setenv("DATABRICKS_TEST_UNIT", "UNI001")
     with pytest.raises(RuntimeError, match="DATABRICKS_CLIENT_ID.*DATABRICKS_CLIENT_SECRET"):
         homologar_databricks.preflight_config()

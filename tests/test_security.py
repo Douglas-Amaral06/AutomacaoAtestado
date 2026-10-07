@@ -41,7 +41,7 @@ def test_cloudflare_header_requires_trusted_peer_and_valid_ip(monkeypatch):
 
 def test_rbac_is_fail_closed_and_limits_analyst_permissions():
     analyst = {"perfil": "analista"}
-    assert permissions_for(analyst) == frozenset({"review"})
+    assert permissions_for(analyst) == frozenset({"review", "upload"})
     require_permission(analyst, "review")
 
     for permission in ("delete", "reprocess", "export", "reports"):
@@ -116,7 +116,7 @@ def test_error_level_business_log_rejects_raw_message(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "UPLOAD_DIR", tmp_path / "uploads")
     monkeypatch.setattr(database, "DB_PATH", tmp_path / "logs.db")
     database.initialize_database()
-    add_log("erro", "erro_da_extensao", "token=dapi12345678901234567890 CPF 12345678909")
+    add_log("erro", "erro_interno", "token=dapi12345678901234567890 CPF 12345678909")
     with database.connect() as connection:
         row = connection.execute("SELECT mensagem,detalhes FROM logs").fetchone()
 
@@ -125,23 +125,15 @@ def test_error_level_business_log_rejects_raw_message(tmp_path, monkeypatch):
     assert "Referência:" in row["mensagem"]
 
 
-def test_extension_manifest_has_security_permissions():
-    with open("extension/manifest.json", encoding="utf-8") as file:
-        manifest = json.load(file)
-    assert manifest["manifest_version"] == 3
-    assert "https://web.whatsapp.com/*" in manifest["host_permissions"]
 
 
 def test_renapsi_brand_assets_and_sidebar_control_are_packaged():
     assert Path("app/static/img/renapsi-logo.png").is_file()
-    assert Path("extension/renapsi-logo.png").is_file()
     base = Path("app/templates/base.html").read_text(encoding="utf-8")
     login = Path("app/templates/login.html").read_text(encoding="utf-8")
-    popup = Path("extension/popup.html").read_text(encoding="utf-8")
     ui = Path("app/static/js/ui.js").read_text(encoding="utf-8")
     assert "renapsi-logo.png" in base
     assert "renapsi-logo.png" in login
-    assert "renapsi-logo.png" in popup
     assert "admin-sidebar-collapsed" in ui
     assert 'setAttribute("aria-expanded"' in ui
 
@@ -158,35 +150,12 @@ def test_no_real_secret_in_example_environment():
         if "=" in line:
             key, value = line.split("=", 1)
             values[key] = value
-    assert values["GEMINI_API_KEY"] == "coloque_a_chave_aqui"
+    assert values["GEMINI_API_KEY"] == ""
     assert values["PROCESSOR_CONTRACT_APPROVED"] == "false"
-    assert values["PROCESSOR_REGION"] == "configure_a_regiao_aprovada"
+    assert values["PROCESSOR_REGION"] == ""
     assert values["GEMINI_MAX_OUTPUT_TOKENS"] == "1024"
     assert values["GEMINI_MAX_DOCUMENT_MB"] == "8"
     assert values["GEMINI_DAILY_REQUEST_LIMIT"] == "50"
     assert values["GEMINI_DAILY_OUTPUT_TOKEN_BUDGET"] == "50000"
-    assert values["APP_SECRET_KEY"] == "gere_com_configurar_seguranca.ps1"
-    assert values["PIPELINE_ATESTADOS_PATH"] == "configure_localmente_no_env"
-    assert values["PIPELINE_BASE_GERAL_PATH"] == "configure_localmente_no_env"
-    assert values["EXTENSION_AUTH_REQUIRED"] == "true"
+    assert values["APP_SECRET_KEY"] == ""
     assert values["TRUSTED_PROXY_IPS"] == "127.0.0.1,::1"
-
-
-def test_unread_chat_monitor_waits_before_inspecting_attachments():
-    content = Path("extension/content.js").read_text(encoding="utf-8")
-    assert "CHAT_INSPECTION_DELAY_MS = 10000" in content
-    assert "await waitForChatInspection(openedIdentity, runId)" in content
-    assert content.index("await waitForChatInspection(openedIdentity, runId)") < content.index(
-        "processUnreadAttachments(unreadCount, isSelfConversation(openedIdentity))"
-    )
-    assert "findAllConversationMedia().filter" in content
-    assert "attachmentDiagnostics" in content
-
-
-def test_unread_chat_marking_is_limited_to_the_current_monitoring_run():
-    content = Path("extension/content.js").read_text(encoding="utf-8")
-    assert "const chatsMarkedUnreadThisRun = new Set()" in content
-    assert "filter((item) => !chatsMarkedUnreadThisRun.has(item.name))" in content
-    assert "async function markChatAsUnread" in content
-    assert "TRUSTED_CONTEXT_CLICK" in content
-    assert content.count("chatsMarkedUnreadThisRun.clear()") >= 2

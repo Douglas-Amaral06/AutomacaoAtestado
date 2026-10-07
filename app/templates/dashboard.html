@@ -10,6 +10,9 @@
   <p class="page-description">Visão geral do processamento de atestados</p>
 </div>
 
+{% if 'upload' in permissions %}
+<div class="section"><a href="/atestados/novo" class="btn btn-primary">Enviar atestado</a></div>
+{% endif %}
 <!-- Fila de Processamento -->
 {% if queue %}
 <div class="section">
@@ -47,7 +50,7 @@
 </div>
 {% endif %}
 
-{% if failed_items and 'reprocess' in permissions %}
+{% if failed_items %}
 <div class="section">
   <h2 class="section-title">Extrações que precisam de atenção</h2>
   <div class="data-table-wrapper">
@@ -65,6 +68,7 @@
           <td>
   <div class="failed-extraction-actions">
 
+    {% if 'reprocess' in permissions %}
     <form
       method="post"
       action="/fila/{{ failure.id }}/reprocessar"
@@ -83,6 +87,7 @@
       </button>
     </form>
 
+    {% endif %}
     {% if 'delete' in permissions %}
       <button
           type="button"
@@ -253,7 +258,7 @@
   <form method="get" action="/" style="display:flex;gap:var(--space-3);align-items:end;margin-bottom:var(--space-4);max-width:760px;">
     <div style="flex:1;">
       <label for="id-documento-search" style="font-weight:var(--font-weight-semibold);">Pesquisar ID do Databricks</label>
-      <input id="id-documento-search" name="q" value="{{ search_query }}" placeholder="Ex.: UNI001_20260828T091116_304b38fa" maxlength="120">
+      <input id="id-documento-search" name="q" value="{{ search_query }}" placeholder="Ex.: SP_20260828T091116_304b38fa" maxlength="120">
     </div>
     {% if status_filter %}<input type="hidden" name="status" value="{{ status_filter }}">{% endif %}
     <button class="btn btn-secondary" type="submit">Pesquisar</button>
@@ -266,7 +271,7 @@
       <div class="empty-state-rule" aria-hidden="true"></div>
       <h3 class="empty-state-title">Nenhum atestado encontrado</h3>
       <p class="empty-state-description">
-        Os documentos capturados pela extensão aparecerão aqui.
+        Os atestados enviados pelo painel aparecerão aqui.
       </p>
     </div>
   </div>

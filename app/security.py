@@ -18,8 +18,8 @@ SESSION_COOKIE = "rh_session"
 PASSWORD_HASHER = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4)
 _DUMMY_PASSWORD_HASH = PASSWORD_HASHER.hash("comparacao-constante-sem-usuario")
 ROLE_PERMISSIONS = {
-    "admin": frozenset({"review", "delete", "reprocess", "export", "reports"}),
-    "analista": frozenset({"review"}),
+    "admin": frozenset({"review", "delete", "reprocess", "export", "reports", "upload"}),
+    "analista": frozenset({"review", "upload"}),
 }
 
 
@@ -207,26 +207,6 @@ def current_user(request: Request, required: bool = True):
 def require_csrf(request: Request, user, supplied: str) -> None:
     if not supplied or not secrets.compare_digest(user["csrf_token"], supplied):
         raise HTTPException(403, "Token CSRF invalido")
-
-
-def verify_service_token(request: Request) -> int | str:
-    if os.getenv("EXTENSION_AUTH_REQUIRED", "true").lower() != "true":
-        return "autenticacao-desabilitada"
-    raw = request.headers.get("x-api-token", "")
-    if not raw:
-        raise HTTPException(401, "Token da extensao ausente")
-    with connect() as connection:
-        row = connection.execute(
-            """SELECT id FROM tokens_servico WHERE token_hash=? AND ativo=1
-               AND (expira_em IS NULL OR expira_em>?)""", (hash_token(raw), utc_now().isoformat())
-        ).fetchone()
-        if row:
-            connection.execute(
-                "UPDATE tokens_servico SET ultimo_uso=? WHERE id=?", (utc_now().isoformat(), row["id"])
-            )
-    if not row:
-        raise HTTPException(401, "Token da extensao invalido")
-    return row["id"]
 
 
 def redact(value: str) -> str:

@@ -31,10 +31,20 @@ def preflight_config() -> dict:
     required = {
         "DATABRICKS_HOST": os.getenv("DATABRICKS_HOST", "").strip(),
         "DATABRICKS_VOLUME_ROOT": os.getenv("DATABRICKS_VOLUME_ROOT", "").strip(),
-        "DATABRICKS_CLIENT_ID": os.getenv("DATABRICKS_CLIENT_ID", "").strip(),
-        "DATABRICKS_CLIENT_SECRET": os.getenv("DATABRICKS_CLIENT_SECRET", "").strip(),
-        "DATABRICKS_TEST_UNIT": os.getenv("DATABRICKS_TEST_UNIT", "").strip(),
     }
+    auth_mode = os.getenv("DATABRICKS_AUTH_MODE", "m2m").strip().lower()
+    if auth_mode == "m2m":
+        required.update({
+            "DATABRICKS_CLIENT_ID": os.getenv("DATABRICKS_CLIENT_ID", "").strip(),
+            "DATABRICKS_CLIENT_SECRET": os.getenv("DATABRICKS_CLIENT_SECRET", "").strip(),
+        })
+    elif auth_mode == "cli":
+        required.update({
+            "DATABRICKS_CLI_PATH": os.getenv("DATABRICKS_CLI_PATH", "").strip(),
+            "DATABRICKS_CLI_PROFILE": os.getenv("DATABRICKS_CLI_PROFILE", "").strip(),
+        })
+    else:
+        raise RuntimeError("DATABRICKS_AUTH_MODE deve ser m2m ou cli.")
     placeholders = ("configure", "coloque", "change-me", "changeme")
     missing = [
         name for name, value in required.items()
@@ -45,13 +55,10 @@ def preflight_config() -> dict:
 
     host = required["DATABRICKS_HOST"].rstrip("/")
     volume = required["DATABRICKS_VOLUME_ROOT"].rstrip("/")
-    unit = required["DATABRICKS_TEST_UNIT"].upper()
     if not host.startswith("https://"):
         raise RuntimeError("DATABRICKS_HOST deve utilizar HTTPS.")
     if not volume.startswith("/Volumes/") or ".." in Path(volume).parts:
         raise RuntimeError("DATABRICKS_VOLUME_ROOT não é um caminho seguro de Volume.")
-    if not re.fullmatch(r"[A-Z0-9_-]+", unit):
-        raise RuntimeError("DATABRICKS_TEST_UNIT possui formato inválido.")
     try:
         timeout = int(os.getenv("DATABRICKS_TIMEOUT_SECONDS", "60"))
         attempts = int(os.getenv("DATABRICKS_MAX_ATTEMPTS", "3"))
@@ -67,7 +74,9 @@ def preflight_config() -> dict:
         "host": host,
         "volume": volume,
         "ambiente_inferido": environment,
-        "unidade_teste": unit,
+        "unidade_teste": "TESTE",
+        "polo_teste": "ZZ",
+        "autenticacao": auth_mode,
         "credenciais_configuradas": True,
         "upload_habilitado": os.getenv("DATABRICKS_UPLOAD_ENABLED", "false").strip().lower() == "true",
         "timeout_segundos": timeout,
@@ -97,14 +106,11 @@ def upload_fictitious(confirmed_volume: str) -> dict:
         document_content=content,
         original_name="atestado-homologacao-ficticio.pdf",
         mime="application/pdf",
-        unidade=os.getenv("DATABRICKS_TEST_UNIT", "UNI001"),
+        unidade="TESTE",
+        polo="ZZ",
+        teste=True,
         data_recebimento=received_at,
-        origem={
-            "id_mensagem": f"messageId-HOMOLOGACAO-{received_at:%Y%m%d%H%M%S}",
-            "id_conversa": "conversa-ficticia",
-            "whatsapp_remetente": "+5511999990000",
-            "whatsapp_destinatario": "+5511988887777",
-        },
+        origem={"operador_id": "opr_" + "0" * 32},  # Identidade sintética de homologação.
         extracao={
             "motor": "HOMOLOGACAO-CONTROLADA",
             "versao": "1.0",

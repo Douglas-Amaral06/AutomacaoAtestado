@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Login - Recebimento de Atestados</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='/css/design-system.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='/css/design-system.css').path }}">
   <style>
     body {
       display: grid;
@@ -133,7 +133,7 @@
 <body>
   <div class="login-container">
     <div class="login-header">
-      <img class="login-logo" src="{{ url_for('static', path='/img/renapsi-logo.png') }}" alt="Renapsi">
+      <img class="login-logo" src="{{ url_for('static', path='/img/renapsi-logo.png').path }}" alt="Renapsi">
       <h1 class="login-title">Atestados RH</h1>
       <p class="login-subtitle">Sistema de recebimento e processamento</p>
     </div>
@@ -174,6 +174,6 @@
     </div>
   </div>
 
-  <script src="{{ url_for('static', path='/js/ui.js') }}"></script>
+  <script src="{{ url_for('static', path='/js/ui.js').path }}"></script>
 </body>
 </html>

@@ -1,7 +1,6 @@
 param(
     [string]$Usuario,
-    [string]$Nome,
-    [switch]$GerarSenha
+    [string]$Nome
 )
 $ErrorActionPreference = "Stop"
 $env:PYTHONDONTWRITEBYTECODE = "1"
@@ -10,7 +9,7 @@ $envFile = Join-Path $projectRoot ".env"
 if (-not (Test-Path -LiteralPath $envFile)) { Copy-Item (Join-Path $projectRoot ".env.example") $envFile }
 $lines = Get-Content -LiteralPath $envFile
 $currentSecret = $lines | Where-Object { $_ -match '^APP_SECRET_KEY=' } | Select-Object -First 1
-if (-not $currentSecret -or $currentSecret -eq 'APP_SECRET_KEY=gere_com_configurar_seguranca.ps1') {
+if (-not $currentSecret -or $currentSecret -eq 'APP_SECRET_KEY=gere_com_configurar_seguranca.ps1' -or $currentSecret -eq 'APP_SECRET_KEY=') {
     $bytes = New-Object byte[] 48
     $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
     $generator.GetBytes($bytes)
@@ -26,8 +25,8 @@ if (-not $currentSecret -or $currentSecret -eq 'APP_SECRET_KEY=gere_com_configur
     Write-Host "APP_SECRET_KEY existente preservada."
 }
 Set-Location -LiteralPath $projectRoot
-if ($Usuario -and $Nome -and $GerarSenha) {
-    & ".\.venv\Scripts\python.exe" (Join-Path $PSScriptRoot "criar_admin.py") --usuario $Usuario --nome $Nome --gerar-senha
+if ($Usuario -and $Nome) {
+    & ".\.venv\Scripts\python.exe" (Join-Path $PSScriptRoot "criar_admin.py") --usuario $Usuario --nome $Nome
 } else {
     & ".\.venv\Scripts\python.exe" (Join-Path $PSScriptRoot "criar_admin.py")
 }

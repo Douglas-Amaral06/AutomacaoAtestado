@@ -29,6 +29,7 @@ Revisar Atestado #{{ item.id }}
 {% endblock %}
 
 {% block content %}
+{% if delivery_error %}<div class="alert alert-error" role="alert">{{ delivery_error }}</div>{% endif %}
 <div class="review-page-actions">
   <button
     type="button"
@@ -74,7 +75,7 @@ Revisar Atestado #{{ item.id }}
       <strong>Rastreabilidade do envio</strong>
       <p style="margin:var(--space-2) 0 0;font-size:var(--font-size-sm);">
         Operador: {{ item.operador_envio_nome or 'Não identificado' }}<br>
-        Entrega: {{ {'aguardando_aprovacao':'Aguardando aprovação','entregue_volume':'Confirmada no Volume','simulado_local':'Simulação local','desabilitada':'Não enviada'}.get(item.status_entrega, 'Sem confirmação') }}
+        Entrega: {{ {'aguardando_aprovacao':'Aguardando aprovação','entregue_volume':'Confirmado no Databricks','entregando':'Enviando ao Databricks','falha_entrega':'Falha na entrega','rejeitado':'Rejeitado','simulado_local':'Simulação local (pendente)','desabilitada':'Não enviada'}.get(item.status_entrega, 'Sem confirmação') }}
         {% if item.id_documento %}<br>ID Databricks: <code>{{ item.id_documento }}</code>{% endif %}
       </p>
     </div>

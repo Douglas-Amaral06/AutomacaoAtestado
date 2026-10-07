@@ -11,11 +11,11 @@ _request_history: dict[str, deque[float]] = defaultdict(deque)
 _daily_quota: dict[tuple[str, str], int] = {}
 
 
-def check_rate_limit(token_id: str, limit: int = 30, window_seconds: int = 3600) -> None:
-    """Registra uma chamada autenticada e bloqueia excesso por token."""
+def check_rate_limit(user_id: str, limit: int = 30, window_seconds: int = 3600) -> None:
+    """Registra uma chamada autenticada e bloqueia excesso por usuário."""
     now = time.monotonic()
     with _lock:
-        history = _request_history[str(token_id)]
+        history = _request_history[str(user_id)]
         cutoff = now - window_seconds
         while history and history[0] <= cutoff:
             history.popleft()
@@ -29,17 +29,17 @@ def check_rate_limit(token_id: str, limit: int = 30, window_seconds: int = 3600)
         history.append(now)
 
 
-def check_daily_quota(token_id: str, incoming_bytes: int, max_bytes: int = 300 * 1024 * 1024) -> None:
-    """Reserva, de forma atômica, a quantidade declarada na cota UTC do token."""
+def check_daily_quota(user_id: str, incoming_bytes: int, max_bytes: int = 300 * 1024 * 1024) -> None:
+    """Reserva, de forma atômica, a quantidade declarada na cota UTC do usuário."""
     incoming_bytes = max(0, int(incoming_bytes))
     today = datetime.now(timezone.utc).date().isoformat()
-    key = (str(token_id), today)
+    key = (str(user_id), today)
     with _lock:
         current = _daily_quota.get(key, 0)
         if current + incoming_bytes > max_bytes:
             raise HTTPException(
                 413,
-                "Cota diária de processamento excedida para este token.",
+                "Cota diária de processamento excedida para este usuário.",
             )
         _daily_quota[key] = current + incoming_bytes
         stale = [entry for entry in _daily_quota if entry[1] != today]

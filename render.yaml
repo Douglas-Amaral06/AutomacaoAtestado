@@ -1,0 +1,75 @@
+services:
+  - type: web
+    name: automacao-atestados
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.14
+      - key: APP_ENV
+        value: pilot
+      - key: APP_SECRET_KEY
+        generateValue: true
+      - key: BOOTSTRAP_USERS_JSON
+        sync: false
+      - key: DATA_DIR
+        value: /tmp/atestados
+      - key: ALLOWED_HOSTS
+        value: 127.0.0.1,localhost,*.onrender.com
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: TRUST_CLOUDFLARE
+        value: "false"
+      - key: LOCAL_BACKUP_ENABLED
+        value: "false"
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: PROCESSOR_CONTRACT_APPROVED
+        sync: false
+      - key: PROCESSOR_REGION
+        sync: false
+      - key: GEMINI_TIMEOUT_SECONDS
+        value: "60"
+      - key: GEMINI_MAX_ATTEMPTS
+        value: "2"
+      - key: GEMINI_MAX_OUTPUT_TOKENS
+        value: "1024"
+      - key: GEMINI_MAX_DOCUMENT_MB
+        value: "8"
+      - key: GEMINI_DAILY_REQUEST_LIMIT
+        value: "50"
+      - key: GEMINI_DAILY_OUTPUT_TOKEN_BUDGET
+        value: "50000"
+      - key: UPLOAD_RATE_LIMIT_PER_HOUR
+        value: "30"
+      - key: UPLOAD_DAILY_QUOTA_MB
+        value: "300"
+      - key: DELIVERY_MODE
+        value: databricks
+      - key: DELIVERY_UNIT
+        value: AUREA
+      - key: DELIVERY_POLO
+        value: SP
+      - key: DELIVERY_TEST
+        value: "false"
+      - key: DATABRICKS_UPLOAD_ENABLED
+        value: "true"
+      - key: DATABRICKS_HOST
+        sync: false
+      - key: DATABRICKS_VOLUME_ROOT
+        value: /Volumes/renapsi_prd/bronze_atestados/atestado
+      - key: DATABRICKS_AUTH_MODE
+        value: m2m
+      - key: DATABRICKS_CLIENT_ID
+        sync: false
+      - key: DATABRICKS_CLIENT_SECRET
+        sync: false
+      - key: DATABRICKS_TIMEOUT_SECONDS
+        value: "60"
+      - key: DATABRICKS_MAX_ATTEMPTS
+        value: "3"
