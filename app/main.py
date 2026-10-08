@@ -129,6 +129,83 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=[host.strip() for host i
 app.add_middleware(UploadBodyLimit)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "app" / "static", html=False), name="static")
 
+@app.get("/teste-databricks-write")
+def teste_databricks_write():
+    host = os.environ["DATABRICKS_HOST"].rstrip("/")
+    token = os.environ["DATABRICKS_TOKEN"]
+
+    diretorio = (
+        "/Volumes/renapsi_prd/bronze_atestados/atestado/"
+        "TESTE/ZZ/2026/10/08"
+    )
+
+    arquivo = f"{diretorio}/_render_probe.txt"
+
+    conteudo = b"Teste de escrita Render -> Databricks"
+
+    auth_headers = {
+        "Authorization": f"Bearer {token}"
+    }
+
+    # 1. Criar diretório
+    dir_response = requests.put(
+        f"{host}/api/2.0/fs/directories{diretorio}",
+        headers=auth_headers,
+        timeout=30,
+    )
+
+    if not 200 <= dir_response.status_code < 300:
+        return {
+            "sucesso": False,
+            "etapa": "criar_diretorio",
+            "http_status": dir_response.status_code,
+            "resposta": dir_response.text[:2000],
+        }
+
+    # 2. Gravar arquivo
+    file_response = requests.put(
+        f"{host}/api/2.0/fs/files{arquivo}?overwrite=true",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/octet-stream",
+        },
+        data=conteudo,
+        timeout=30,
+    )
+
+    if not 200 <= file_response.status_code < 300:
+        return {
+            "sucesso": False,
+            "etapa": "gravar_arquivo",
+            "http_status": file_response.status_code,
+            "resposta": file_response.text[:2000],
+        }
+
+    # 3. Conferir se realmente existe
+    head_response = requests.head(
+        f"{host}/api/2.0/fs/files{arquivo}",
+        headers=auth_headers,
+        timeout=30,
+    )
+
+    if not 200 <= head_response.status_code < 300:
+        return {
+            "sucesso": False,
+            "etapa": "conferir_arquivo",
+            "http_status": head_response.status_code,
+            "resposta": head_response.text[:2000],
+        }
+
+    return {
+        "sucesso": True,
+        "mensagem": "Render conseguiu gravar no Volume do Databricks.",
+        "arquivo": arquivo,
+        "bytes_enviados": len(conteudo),
+        "bytes_databricks": head_response.headers.get("Content-Length"),
+        "status_upload": file_response.status_code,
+        "status_head": head_response.status_code,
+    }
+
 @app.get("/teste-databricks")
 def teste_databricks():
     host = os.environ["DATABRICKS_HOST"].rstrip("/")
