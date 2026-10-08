@@ -3,6 +3,7 @@ import io
 import json
 import os
 import re
+import requests
 import secrets
 import threading
 import time
@@ -127,6 +128,58 @@ app = FastAPI(title="Recebimento Seguro de Atestados", docs_url=None, redoc_url=
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=[host.strip() for host in os.getenv("ALLOWED_HOSTS", "127.0.0.1,localhost").split(",") if host.strip()])
 app.add_middleware(UploadBodyLimit)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "app" / "static", html=False), name="static")
+
+@app.get("/teste-databricks")
+def teste_databricks():
+    host = os.environ["DATABRICKS_HOST"].rstrip("/")
+    token = os.environ["DATABRICKS_TOKEN"]
+    warehouse_id = os.environ["DATABRICKS_SQL_WAREHOUSE_ID"]
+
+    query = """
+        SELECT
+            id_documento,
+            versao_schema,
+            canal
+        FROM renapsi_prd.bronze_atestados.atestado_whatsapp
+        LIMIT 5
+    """
+
+    response = requests.post(
+        f"{host}/api/2.0/sql/statements",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "warehouse_id": warehouse_id,
+            "statement": query,
+            "wait_timeout": "50s",
+            "disposition": "INLINE",
+            "format": "JSON_ARRAY",
+        },
+        timeout=60,
+    )
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw": response.text}
+
+    if not response.ok:
+        return {
+            "sucesso": False,
+            "http_status": response.status_code,
+            "resposta": data,
+        }
+
+    estado = data.get("status", {}).get("state")
+
+    return {
+        "sucesso": estado == "SUCCEEDED",
+        "estado": estado,
+        "statement_id": data.get("statement_id"),
+        "linhas": data.get("result", {}).get("data_array", []),
+    }
 
 
 @app.exception_handler(Exception)
