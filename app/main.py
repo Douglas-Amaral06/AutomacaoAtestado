@@ -104,8 +104,25 @@ async def lifespan(_app):
             raise RuntimeError("O piloto exige COOKIE_SECURE=true")
         if os.getenv("TRUST_CLOUDFLARE", "false").lower() != "false":
             raise RuntimeError("No piloto Render, TRUST_CLOUDFLARE deve ser false")
-        if os.getenv("DATABRICKS_AUTH_MODE", "m2m").lower() != "m2m":
-            raise RuntimeError("O piloto exige autenticação M2M")
+        databricks_auth_mode = os.getenv(
+    "DATABRICKS_AUTH_MODE",
+    "m2m"
+).strip().lower()
+
+if databricks_auth_mode not in {"m2m", "token"}:
+    raise RuntimeError(
+        "O piloto exige autenticação M2M "
+        "ou token temporário controlado"
+    )
+
+if (
+    databricks_auth_mode == "token"
+    and not os.getenv("DATABRICKS_TOKEN", "").strip()
+):
+    raise RuntimeError(
+        "DATABRICKS_TOKEN é obrigatório "
+        "quando DATABRICKS_AUTH_MODE=token"
+    )
     initialize_database()
     bootstrap_users()
     if os.getenv("APP_ENV", "development").lower() in {"pilot", "production"}:

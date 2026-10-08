@@ -81,6 +81,37 @@ class LocalFakeStorageClient:
                 temporary.replace(path)
         finally:
             temporary.unlink(missing_ok=True)
+class DatabricksTokenStorageClient(DatabricksStorageClient):
+    """Files API usando um Bearer token fornecido externamente."""
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        token: str,
+        volume_root: str,
+        timeout_seconds: int = 60,
+        max_attempts: int = 3,
+    ) -> None:
+        self._static_token = token.strip()
+
+        if not self._static_token:
+            raise ValueError(
+                "DATABRICKS_TOKEN é obrigatório no modo token."
+            )
+
+        super().__init__(
+            host=host,
+            client_id="external-token",
+            client_secret="external-token",
+            volume_root=volume_root,
+            timeout_seconds=timeout_seconds,
+            max_attempts=max_attempts,
+        )
+
+    def _token(self, *, force_refresh: bool = False) -> str:
+        return self._static_token
+            
 
 
 class DatabricksStorageClient:

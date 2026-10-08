@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .storage_client import (
     DatabricksCliStorageClient,
     DatabricksStorageClient,
+    DatabricksTokenStorageClient,
     LocalFakeStorageClient,
     StorageClient,
 )
@@ -489,22 +490,54 @@ def databricks_storage_from_env() -> DatabricksStorageClient:
         "timeout_seconds": timeout,
         "max_attempts": attempts,
     }
-    auth_mode = os.getenv("DATABRICKS_AUTH_MODE", "m2m").strip().lower()
-    if auth_mode == "cli":
-        if os.getenv("APP_ENV", "development").strip().lower() not in {"development", "local", "test"}:
-            raise RuntimeError("Autenticação U2M pela CLI é permitida somente no ambiente local.")
-        return DatabricksCliStorageClient(
-            **common,
-            cli_path=os.getenv("DATABRICKS_CLI_PATH", ""),
-            profile=os.getenv("DATABRICKS_CLI_PROFILE", "atestados-u2m"),
+    auth_mode = os.getenv(
+    "DATABRICKS_AUTH_MODE",
+    "m2m"
+).strip().lower()
+
+if auth_mode == "cli":
+    if os.getenv(
+        "APP_ENV",
+        "development"
+    ).strip().lower() not in {
+        "development",
+        "local",
+        "test",
+    }:
+        raise RuntimeError(
+            "Autenticação U2M pela CLI é permitida "
+            "somente no ambiente local."
         )
-    if auth_mode != "m2m":
-        raise RuntimeError("DATABRICKS_AUTH_MODE deve ser 'm2m' ou 'cli'.")
-    return DatabricksStorageClient(
+
+    return DatabricksCliStorageClient(
         **common,
-        client_id=os.getenv("DATABRICKS_CLIENT_ID", ""),
-        client_secret=os.getenv("DATABRICKS_CLIENT_SECRET", ""),
+        cli_path=os.getenv("DATABRICKS_CLI_PATH", ""),
+        profile=os.getenv(
+            "DATABRICKS_CLI_PROFILE",
+            "atestados-u2m",
+        ),
     )
+
+if auth_mode == "token":
+    return DatabricksTokenStorageClient(
+        **common,
+        token=os.getenv("DATABRICKS_TOKEN", ""),
+    )
+
+if auth_mode != "m2m":
+    raise RuntimeError(
+        "DATABRICKS_AUTH_MODE deve ser "
+        "'m2m', 'token' ou 'cli'."
+    )
+
+return DatabricksStorageClient(
+    **common,
+    client_id=os.getenv("DATABRICKS_CLIENT_ID", ""),
+    client_secret=os.getenv(
+        "DATABRICKS_CLIENT_SECRET",
+        "",
+    ),
+)
 
 
 class LocalDeliverySimulator:
