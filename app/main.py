@@ -97,50 +97,84 @@ def maintenance_worker():
 
 @asynccontextmanager
 async def lifespan(_app):
-    if os.getenv("APP_ENV", "development").lower() in {"pilot", "production"}:
+    app_env = os.getenv("APP_ENV", "development").strip().lower()
+
+    if app_env in {"pilot", "production"}:
         from .security import _app_secret
+
         _app_secret()
+
         if os.getenv("COOKIE_SECURE", "false").lower() != "true":
             raise RuntimeError("O piloto exige COOKIE_SECURE=true")
+
         if os.getenv("TRUST_CLOUDFLARE", "false").lower() != "false":
-            raise RuntimeError("No piloto Render, TRUST_CLOUDFLARE deve ser false")
+            raise RuntimeError(
+                "No piloto Render, TRUST_CLOUDFLARE deve ser false"
+            )
+
         databricks_auth_mode = os.getenv(
-    "DATABRICKS_AUTH_MODE",
-    "m2m"
-).strip().lower()
+            "DATABRICKS_AUTH_MODE",
+            "m2m",
+        ).strip().lower()
 
-if databricks_auth_mode not in {"m2m", "token"}:
-    raise RuntimeError(
-        "O piloto exige autenticação M2M "
-        "ou token temporário controlado"
-    )
+        if databricks_auth_mode not in {"m2m", "token"}:
+            raise RuntimeError(
+                "O piloto exige autenticação M2M "
+                "ou token temporário controlado"
+            )
 
-if (
-    databricks_auth_mode == "token"
-    and not os.getenv("DATABRICKS_TOKEN", "").strip()
-):
-    raise RuntimeError(
-        "DATABRICKS_TOKEN é obrigatório "
-        "quando DATABRICKS_AUTH_MODE=token"
-    )
+        if (
+            databricks_auth_mode == "token"
+            and not os.getenv("DATABRICKS_TOKEN", "").strip()
+        ):
+            raise RuntimeError(
+                "DATABRICKS_TOKEN é obrigatório "
+                "quando DATABRICKS_AUTH_MODE=token"
+            )
+
     initialize_database()
     bootstrap_users()
-    if os.getenv("APP_ENV", "development").lower() in {"pilot", "production"}:
+
+    if app_env in {"pilot", "production"}:
         with connect() as connection:
-            if not connection.execute("SELECT 1 FROM usuarios WHERE ativo=1 AND perfil='admin'").fetchone():
-                raise RuntimeError("Configure um administrador ativo em BOOTSTRAP_USERS_JSON antes de iniciar o piloto")
+            admin = connection.execute(
+                """
+                SELECT 1
+                FROM usuarios
+                WHERE ativo = 1
+                  AND perfil = 'admin'
+                """
+            ).fetchone()
+
+            if not admin:
+                raise RuntimeError(
+                    "Configure um administrador ativo em "
+                    "BOOTSTRAP_USERS_JSON antes de iniciar o piloto"
+                )
+
     _worker_stop.clear()
-    thread = threading.Thread(target=queue_worker, daemon=True, name="fila-atestados")
-    maintenance = threading.Thread(target=maintenance_worker, daemon=True, name="manutencao-atestados")
+
+    thread = threading.Thread(
+        target=queue_worker,
+        daemon=True,
+        name="fila-atestados",
+    )
+
+    maintenance = threading.Thread(
+        target=maintenance_worker,
+        daemon=True,
+        name="manutencao-atestados",
+    )
+
     thread.start()
+
     if os.getenv("LOCAL_BACKUP_ENABLED", "false").lower() == "true":
         maintenance.start()
+
     try:
         yield
     finally:
         _worker_stop.set()
-
-
 app = FastAPI(title="Recebimento Seguro de Atestados", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=[host.strip() for host in os.getenv("ALLOWED_HOSTS", "127.0.0.1,localhost").split(",") if host.strip()])
 app.add_middleware(UploadBodyLimit)

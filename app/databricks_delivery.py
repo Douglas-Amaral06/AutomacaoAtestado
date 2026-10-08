@@ -479,67 +479,82 @@ def configured_delivery_service() -> DeliveryService | None:
 
 def databricks_storage_from_env() -> DatabricksStorageClient:
     """Monta o cliente sem realizar rede e sem expor credenciais."""
+
     try:
         timeout = int(os.getenv("DATABRICKS_TIMEOUT_SECONDS", "60"))
         attempts = int(os.getenv("DATABRICKS_MAX_ATTEMPTS", "3"))
     except ValueError as error:
-        raise RuntimeError("Timeout ou número de tentativas do Databricks inválido.") from error
+        raise RuntimeError(
+            "Timeout ou número de tentativas do Databricks inválido."
+        ) from error
+
     common = {
         "host": os.getenv("DATABRICKS_HOST", ""),
-        "volume_root": os.getenv("DATABRICKS_VOLUME_ROOT", OFFICIAL_VOLUME_ROOT),
+        "volume_root": os.getenv(
+            "DATABRICKS_VOLUME_ROOT",
+            OFFICIAL_VOLUME_ROOT,
+        ),
         "timeout_seconds": timeout,
         "max_attempts": attempts,
     }
-    auth_mode = os.getenv(
-    "DATABRICKS_AUTH_MODE",
-    "m2m"
-).strip().lower()
 
-if auth_mode == "cli":
-    if os.getenv(
-        "APP_ENV",
-        "development"
-    ).strip().lower() not in {
-        "development",
-        "local",
-        "test",
-    }:
-        raise RuntimeError(
-            "Autenticação U2M pela CLI é permitida "
-            "somente no ambiente local."
+    auth_mode = os.getenv(
+        "DATABRICKS_AUTH_MODE",
+        "m2m",
+    ).strip().lower()
+
+    if auth_mode == "cli":
+        if os.getenv(
+            "APP_ENV",
+            "development",
+        ).strip().lower() not in {
+            "development",
+            "local",
+            "test",
+        }:
+            raise RuntimeError(
+                "Autenticação U2M pela CLI é permitida "
+                "somente no ambiente local."
+            )
+
+        return DatabricksCliStorageClient(
+            **common,
+            cli_path=os.getenv(
+                "DATABRICKS_CLI_PATH",
+                "",
+            ),
+            profile=os.getenv(
+                "DATABRICKS_CLI_PROFILE",
+                "atestados-u2m",
+            ),
         )
 
-    return DatabricksCliStorageClient(
+    if auth_mode == "token":
+        return DatabricksTokenStorageClient(
+            **common,
+            token=os.getenv(
+                "DATABRICKS_TOKEN",
+                "",
+            ),
+        )
+
+    if auth_mode != "m2m":
+        raise RuntimeError(
+            "DATABRICKS_AUTH_MODE deve ser "
+            "'m2m', 'token' ou 'cli'."
+        )
+
+    return DatabricksStorageClient(
         **common,
-        cli_path=os.getenv("DATABRICKS_CLI_PATH", ""),
-        profile=os.getenv(
-            "DATABRICKS_CLI_PROFILE",
-            "atestados-u2m",
+        client_id=os.getenv(
+            "DATABRICKS_CLIENT_ID",
+            "",
+        ),
+        client_secret=os.getenv(
+            "DATABRICKS_CLIENT_SECRET",
+            "",
         ),
     )
-
-if auth_mode == "token":
-    return DatabricksTokenStorageClient(
-        **common,
-        token=os.getenv("DATABRICKS_TOKEN", ""),
-    )
-
-if auth_mode != "m2m":
-    raise RuntimeError(
-        "DATABRICKS_AUTH_MODE deve ser "
-        "'m2m', 'token' ou 'cli'."
-    )
-
-return DatabricksStorageClient(
-    **common,
-    client_id=os.getenv("DATABRICKS_CLIENT_ID", ""),
-    client_secret=os.getenv(
-        "DATABRICKS_CLIENT_SECRET",
-        "",
-    ),
-)
-
-
 class LocalDeliverySimulator:
     """Adaptador local que une preparação, delivery e o fake storage em testes."""
 
