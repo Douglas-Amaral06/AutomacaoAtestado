@@ -53,6 +53,7 @@ def sha256_bytes(content: bytes) -> str:
 
 
 UNIT_POLES = {
+    "TESTE": {"ZZ"},
     "AUREA": {"ES", "MG", "RJ", "SP"},
     "CERRADO": {"DF", "GO", "TO"},
     "BOJADOR": {"AC", "AL", "AM", "AP", "BA", "CE", "MA", "MS", "MT", "PA", "PB", "PE", "PI", "RN", "RO", "RR", "SE"},
