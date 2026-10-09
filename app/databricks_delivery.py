@@ -20,6 +20,7 @@ from .storage_client import (
 )
 from .validation import document_type as normalize_document_type
 
+#Socorro?
 
 SCHEMA_VERSION = "1.2"
 try:
