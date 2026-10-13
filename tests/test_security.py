@@ -138,6 +138,13 @@ def test_renapsi_brand_assets_and_sidebar_control_are_packaged():
     assert 'setAttribute("aria-expanded"' in ui
 
 
+def test_cpf_field_accepts_all_digits_with_visual_mask():
+    review = Path("app/templates/review.html").read_text(encoding="utf-8")
+    cpf_field = review.split('id="cpf"', 1)[1].split(">", 1)[0]
+    assert 'maxlength="14"' in cpf_field
+    assert 'inputmode="numeric"' in cpf_field
+
+
 def test_sensitive_runtime_files_are_ignored_by_git():
     ignore = Path(".gitignore").read_text(encoding="utf-8")
     for rule in (".env", "data/*.db", "data/*.xlsx", "data/uploads/*", "data/onboarding/*", "backups/*.zip", ".spreadsheet-work/"):

@@ -199,7 +199,7 @@ Revisar Atestado #{{ item.id }}
             value="{{ item.cpf or '' }}"
             required
             inputmode="numeric"
-            maxlength="11"
+            maxlength="14"
             autocomplete="off"
             aria-describedby="cpf-feedback"
             class="{% if 'CPF inválido ou ausente.' in validation.errors %}review-field-error{% endif %}"
