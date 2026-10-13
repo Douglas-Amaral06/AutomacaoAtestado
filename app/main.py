@@ -3,7 +3,6 @@ import io
 import json
 import os
 import re
-import requests
 import secrets
 import threading
 import time
@@ -180,136 +179,6 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=[host.strip() for host i
 app.add_middleware(UploadBodyLimit)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "app" / "static", html=False), name="static")
 
-@app.get("/teste-databricks-write")
-def teste_databricks_write():
-    host = os.environ["DATABRICKS_HOST"].rstrip("/")
-    token = os.environ["DATABRICKS_TOKEN"]
-
-    diretorio = (
-        "/Volumes/renapsi_prd/bronze_atestados/atestado/"
-        "TESTE/ZZ/2026/10/08"
-    )
-
-    arquivo = f"{diretorio}/_render_probe.txt"
-
-    conteudo = b"Teste de escrita Render -> Databricks"
-
-    auth_headers = {
-        "Authorization": f"Bearer {token}"
-    }
-
-    # 1. Criar diretório
-    dir_response = requests.put(
-        f"{host}/api/2.0/fs/directories{diretorio}",
-        headers=auth_headers,
-        timeout=30,
-    )
-
-    if not 200 <= dir_response.status_code < 300:
-        return {
-            "sucesso": False,
-            "etapa": "criar_diretorio",
-            "http_status": dir_response.status_code,
-            "resposta": dir_response.text[:2000],
-        }
-
-    # 2. Gravar arquivo
-    file_response = requests.put(
-        f"{host}/api/2.0/fs/files{arquivo}?overwrite=true",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/octet-stream",
-        },
-        data=conteudo,
-        timeout=30,
-    )
-
-    if not 200 <= file_response.status_code < 300:
-        return {
-            "sucesso": False,
-            "etapa": "gravar_arquivo",
-            "http_status": file_response.status_code,
-            "resposta": file_response.text[:2000],
-        }
-
-    # 3. Conferir se realmente existe
-    head_response = requests.head(
-        f"{host}/api/2.0/fs/files{arquivo}",
-        headers=auth_headers,
-        timeout=30,
-    )
-
-    if not 200 <= head_response.status_code < 300:
-        return {
-            "sucesso": False,
-            "etapa": "conferir_arquivo",
-            "http_status": head_response.status_code,
-            "resposta": head_response.text[:2000],
-        }
-
-    return {
-        "sucesso": True,
-        "mensagem": "Render conseguiu gravar no Volume do Databricks.",
-        "arquivo": arquivo,
-        "bytes_enviados": len(conteudo),
-        "bytes_databricks": head_response.headers.get("Content-Length"),
-        "status_upload": file_response.status_code,
-        "status_head": head_response.status_code,
-    }
-
-@app.get("/teste-databricks")
-def teste_databricks():
-    host = os.environ["DATABRICKS_HOST"].rstrip("/")
-    token = os.environ["DATABRICKS_TOKEN"]
-    warehouse_id = os.environ["DATABRICKS_SQL_WAREHOUSE_ID"]
-
-    query = """
-        SELECT
-            id_documento,
-            versao_schema,
-            canal
-        FROM renapsi_prd.bronze_atestados.atestado_whatsapp
-        LIMIT 5
-    """
-
-    response = requests.post(
-        f"{host}/api/2.0/sql/statements",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "warehouse_id": warehouse_id,
-            "statement": query,
-            "wait_timeout": "50s",
-            "disposition": "INLINE",
-            "format": "JSON_ARRAY",
-        },
-        timeout=60,
-    )
-
-    try:
-        data = response.json()
-    except Exception:
-        data = {"raw": response.text}
-
-    if not response.ok:
-        return {
-            "sucesso": False,
-            "http_status": response.status_code,
-            "resposta": data,
-        }
-
-    estado = data.get("status", {}).get("state")
-
-    return {
-        "sucesso": estado == "SUCCEEDED",
-        "estado": estado,
-        "statement_id": data.get("statement_id"),
-        "linhas": data.get("result", {}).get("data_array", []),
-    }
-
-
 @app.exception_handler(Exception)
 async def unexpected_exception_handler(_request: Request, error: Exception):
     """Impede que exceções não tratadas exponham mensagens no FastAPI/Uvicorn."""
@@ -451,6 +320,7 @@ def login(request: Request, usuario: str = Form(..., min_length=1, max_length=10
 def logout(request: Request, csrf_token: str = Form(...)):
     user = current_user(request); require_csrf(request, user, csrf_token)
     with connect() as connection: connection.execute("DELETE FROM sessoes WHERE id=?", (user["session_id"],))
+    add_log("info", "logout", f"Logout realizado por usuario #{user['id']}")
     response = RedirectResponse("/login", 303); response.delete_cookie(SESSION_COOKIE); return response
 
 
@@ -590,6 +460,7 @@ def upload_document(request: Request, background_tasks: BackgroundTasks,
         queue_id = ingest_document(file, user["id"])
     except HTTPException as error:
         return upload_page(request, user, error.detail, error.status_code)
+    add_log("info", "upload_recebido", f"Upload #{queue_id} recebido do usuario #{user['id']}")
     background_tasks.add_task(process_uploaded_item, queue_id)
     return RedirectResponse(f"/envios/{queue_id}", 303)
 
@@ -729,6 +600,9 @@ def review_document(
                     raise DeliveryCollisionError()
                 connection.execute("UPDATE atestados SET id_documento=? WHERE id=? AND revisado_em=?",
                                    (prepared.payload["id_documento"], record_id, reservation))
+            add_log("info", "entrega_databricks_iniciada", f"Entrega do atestado #{record_id} iniciada", {
+                "atestado_id": record_id, "id_documento": prepared.payload["id_documento"],
+            })
             delivery_service.deliver(prepared)
             real_delivery = mode == "databricks"
             status = "confirmado" if real_delivery else "pendente"
@@ -741,6 +615,9 @@ def review_document(
                 )
                 if cursor.rowcount != 1:
                     raise RuntimeError("Reserva de entrega perdida")
+            add_log("info", "entrega_databricks_concluida", f"Entrega do atestado #{record_id} concluida", {
+                "atestado_id": record_id, "id_documento": prepared.payload["id_documento"],
+            })
         except Exception as error:
             safe_message, details = format_safe_error(error)
             add_log("erro", "entrega_falhou", safe_message, {**details, "atestado_id": record_id})

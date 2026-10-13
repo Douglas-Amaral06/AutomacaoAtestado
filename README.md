@@ -41,7 +41,7 @@ O ID público tem formato `opr_<32 hex>` e é derivado de HMAC-SHA256 de `operad
 
 Também é aceito `operador_public_id` explícito. Para transportar identidades de usuários anteriores ao bootstrap, copie os IDs exibidos em **Usuários** para esse campo no JSON. Isso preserva o vínculo com entregas históricas, sem trocar IDs já cadastrados. IDs devem ser únicos. Contas criadas apenas pelo painel desaparecem se o SQLite for perdido: inclua os usuários necessários no bootstrap. O piloto exige ao menos um administrador ativo na inicialização.
 
-Administrador: revisão, upload, exclusão local, reprocessamento, exportação e relatórios. Analista: revisão e upload. Os dois usam sessão e CSRF; a identidade de envio vem exclusivamente da sessão.
+Administrador: revisão, upload, exclusão local, reprocessamento, exportação, relatórios e gestão de usuários. Analista: revisão e upload. Os dois usam sessão e CSRF; a identidade de envio vem exclusivamente da sessão. Analistas não acessam usuários, logs, relatórios, exportação, exclusões ou reprocessamentos administrativos.
 
 ## Upload e revisão
 
@@ -104,13 +104,12 @@ Referências de configuração: [FastAPI no Render](https://render.com/docs/depl
 | `DATABRICKS_UPLOAD_ENABLED` | `true` |
 | `DATABRICKS_HOST` | URL HTTPS do workspace autorizado |
 | `DATABRICKS_VOLUME_ROOT` | `/Volumes/renapsi_prd/bronze_atestados/atestado` |
-| `DATABRICKS_AUTH_MODE` | `m2m` |
-| `DATABRICKS_CLIENT_ID` | Identidade da Service Principal |
-| `DATABRICKS_CLIENT_SECRET` | Segredo OAuth M2M |
+| `DATABRICKS_AUTH_MODE` | `token` durante o piloto controlado |
+| `DATABRICKS_TOKEN` | Token temporário homologado, armazenado como segredo |
 | `DATABRICKS_TIMEOUT_SECONDS` | `60` |
 | `DATABRICKS_MAX_ATTEMPTS` | `3` |
 
-`PORT` é fornecida pelo Render. As demais opções locais estão em `.env.example`. `GEMINI_MIN_INTERVAL_SECONDS=13`, `GEMINI_IMAGE_ENHANCEMENT=true` e retenção desabilitada continuam como padrões; não é necessário configurá-las no Render. O piloto não usa CLI/U2M.
+`PORT` é fornecida pelo Render. As demais opções locais estão em `.env.example`. `GEMINI_MIN_INTERVAL_SECONDS=13`, `GEMINI_IMAGE_ENHANCEMENT=true` e retenção desabilitada continuam como padrões; não é necessário configurá-las no Render. O piloto não usa CLI/U2M. `DATABRICKS_CLIENT_ID` e `DATABRICKS_CLIENT_SECRET` ficam reservadas para uma migração futura, sem implementação nesta etapa.
 
 ### Limitações aceitas do piloto
 
@@ -128,7 +127,7 @@ Antes de migrar uma instalação local com dados úteis, encerre a versão anter
 
 ## Databricks e validação
 
-Consulte [contrato e homologação](docs/INTEGRACAO_DATABRICKS_V2.md) e o [roteiro completo do piloto](docs/PILOTO.md).
+Consulte [contrato e homologação](docs/INTEGRACAO_DATABRICKS_V2.md), o [roteiro do piloto](docs/PILOTO.md), o [checklist de QA](docs/PILOTO_CHECKLIST.md) e o [inventário de variáveis](docs/VARIAVEIS_AMBIENTE.md).
 
 ```powershell
 .venv\Scripts\python.exe scripts\homologar_entrega_fake.py
@@ -136,7 +135,9 @@ Consulte [contrato e homologação](docs/INTEGRACAO_DATABRICKS_V2.md) e o [rotei
 .venv\Scripts\python.exe scripts\homologar_databricks.py --check-access
 ```
 
-O primeiro usa somente storage local fictício. O segundo valida configuração sem rede. O terceiro autentica e lê o Volume, sem gravar. A homologação real pelo painel deve conferir o par, hash, operador, destino e ingestão Bronze. O estado `entregue_volume` confirma a entrega ao Volume; não consulta a conclusão da ingestão Bronze.
+O primeiro usa somente storage local fictício. O segundo valida configuração sem rede. O terceiro autentica e lê o Volume, sem gravar. A homologação real pelo painel deve conferir o par, hash, operador, destino e ingestão Bronze. O estado `entregue_volume` confirma a entrega ao Volume; não consulta a conclusão da ingestão Bronze. No piloto, a autenticação usa o token temporário já homologado; OAuth M2M fica para uma etapa posterior.
+
+Para investigar uma falha, copie a referência exibida no painel e procure o mesmo `correlation_id` nos logs do Render ou em **Logs** no painel administrativo. Em falha de entrega, não exclua o registro: confirme a disponibilidade do Databricks e tente aprovar novamente. As correções permanecem salvas e o status fica `falha_entrega` até uma entrega bem-sucedida.
 
 ## Segurança e testes
 

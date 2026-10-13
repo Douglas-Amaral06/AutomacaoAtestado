@@ -38,4 +38,4 @@ O caso 25 é validado também por teste automatizado com dois bancos independent
 
 Os casos de indisponibilidade/429/falha de integridade são cobertos offline pela suíte. Não provoque consumo artificial da quota real. Para testar falha de entrega no ambiente, use uma configuração controlada e depois restaure-a, preservando a chave interna e os usuários.
 
-A aprovação em modo fake permanece pendente e é exibida como simulação local. O piloto recusa aprovação nesse modo. A validação final requer DELIVERY_MODE=databricks e OAuth M2M.
+A aprovação em modo fake permanece pendente e é exibida como simulação local. O piloto recusa aprovação nesse modo. A validação final requer `DELIVERY_MODE=databricks` e, nesta etapa, o token temporário homologado. OAuth M2M fica para uma etapa posterior.

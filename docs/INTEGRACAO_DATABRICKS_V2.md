@@ -2,7 +2,7 @@
 
 ## Fluxo preservado
 
-`DeliveryService` valida o contrato, escreve o documento por `StorageClient`, relê seus bytes e compara SHA-256, e só então grava o JSON-sinal. `DatabricksStorageClient` usa Files API e OAuth M2M. A aplicação só marca `confirmado / entregue_volume` após essa sequência concluir. Rejeições não acessam a integração.
+`DeliveryService` valida o contrato, escreve o documento por `StorageClient`, relê seus bytes e compara SHA-256, e só então grava o JSON-sinal. `DatabricksStorageClient` usa a Files API e, no piloto atual, o token temporário homologado. A aplicação só marca `confirmado / entregue_volume` após essa sequência concluir. Rejeições não acessam a integração. OAuth M2M fica para uma etapa posterior.
 
 Destino padrão: `/Volumes/renapsi_prd/bronze_atestados/atestado`.
 
@@ -57,7 +57,7 @@ Esse bloqueio é local ao SQLite do piloto. A fórmula continua tendo a limitaç
 
 1. Sem rede: `python scripts/homologar_entrega_fake.py`. Usa TESTE/ZZ, identidade opaca sintética explícita, campos contratuais antigos nulos, par e SHA verificados.
 2. Sem rede: `python scripts/homologar_databricks.py --check-config`. Verifica configurações sem retornar credenciais.
-3. Somente leitura: `python scripts/homologar_databricks.py --check-access`. Valida OAuth e acesso ao Volume. No Render, usar exclusivamente `DATABRICKS_AUTH_MODE=m2m`.
+3. Somente leitura: `python scripts/homologar_databricks.py --check-access`. Valida a autenticação configurada e o acesso ao Volume. No Render do piloto, usar `DATABRICKS_AUTH_MODE=token` e manter `DATABRICKS_TOKEN` apenas no cofre de variáveis do serviço.
 4. Na URL piloto, enviar documento autorizado, revisar e aprovar. Conferir ID no painel, bytes remotos, SHA, JSON, AUREA/SP, canal e operador. Conferir a linha Bronze com a engenharia.
 5. Rejeitar outro documento e confirmar ausência de nova escrita. Simular falha controlada e verificar edição preservada/pedido pendente.
 

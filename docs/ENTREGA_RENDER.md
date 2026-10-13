@@ -11,7 +11,7 @@ O [README](../README.md) contém instalação local, bootstrap dos usuários e *
 - Health: `/healthz`
 - Usuários: `BOOTSTRAP_USERS_JSON` secreto, com um administrador; Argon2id e identidade explícita ou HMAC estável com APP_SECRET_KEY.
 - Render: Python 3.12.14, APP_ENV=pilot, cookies Secure, DATA_DIR temporário, backups automáticos desabilitados, uma instância/processo.
-- Databricks: AUREA/SP, canal painel, DELIVERY_TEST=false, OAuth M2M.
+- Databricks: AUREA/SP, canal painel, `DELIVERY_TEST=false` e token temporário homologado armazenado no Render.
 - Validação: [contrato e homologação](INTEGRACAO_DATABRICKS_V2.md), [roteiro do piloto](PILOTO.md).
 
 ## Schema e fluxo
@@ -36,7 +36,7 @@ Não foram usados o banco real, documentos reais ou credenciais para os testes. 
 ## Pendências externas
 
 1. Provisionar o serviço na conta Render e preencher os segredos.
-2. Disponibilizar credenciais M2M e permissões ao workspace/Volume; validar conectividade da nova hospedagem.
+2. Manter o token homologado e as permissões do workspace/Volume; migrar para OAuth M2M em etapa posterior.
 3. Informar aprovação/região do processamento externo, caso ainda não existam; bloqueio atual preservado.
 4. Frequência validar o roteiro operacional e engenharia conferir ingestão Bronze com origem painel.
 

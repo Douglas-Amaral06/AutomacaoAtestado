@@ -106,6 +106,7 @@ def process_queue_item(queue_id: int) -> dict:
         if not path.is_file():
             raise FileNotFoundError(path.name)
         renew_queue_lease(queue_id, lock_token)
+        add_log("info", "extracao_iniciada", f"Extracao do upload #{queue_id} iniciada", {"fila_id": queue_id})
         extracted = extract_document(path)
         extracted["cpf"] = normalize_cpf(extracted.get("cpf"))
         extracted["cid"] = normalize_cid(extracted.get("cid"))
@@ -153,6 +154,9 @@ def process_queue_item(queue_id: int) -> dict:
                 (atestado_id, utc_now().isoformat(), queue_id, lock_token),
             )
         add_log("info", "atestado_salvo", f"Atestado #{atestado_id} salvo para conferencia", {"entrega": "aguardando_aprovacao"})
+        add_log("info", "extracao_concluida", f"Extracao do upload #{queue_id} concluida", {
+            "fila_id": queue_id, "atestado_id": atestado_id,
+        })
         return {
             "id": atestado_id,
             "status": "pendente",

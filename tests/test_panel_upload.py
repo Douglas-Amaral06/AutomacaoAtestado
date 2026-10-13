@@ -298,11 +298,13 @@ def test_health_and_removed_routes(panel):
     assert client.get("/healthz").json() == {"status": "ok"}
     for method, path in [("get", "/extensao"), ("post", "/api/parear"), ("post", "/api/atestados"),
                          ("post", "/api/logs"), ("get", "/api/extensao/status"),
-                         ("post", "/extensao/gerar-codigo"), ("post", "/extensao/tokens/1/revogar")]:
+                         ("post", "/extensao/gerar-codigo"), ("post", "/extensao/tokens/1/revogar"),
+                         ("get", "/teste-databricks"), ("get", "/teste-databricks-write"),
+                         ("get", "/teste-config-databricks")]:
         assert getattr(client, method)(path).status_code == 404
     paths = [getattr(route, "path", "") for route in main.app.routes]
     assert paths.count("/fila/{queue_id}/excluir") == 1
-    assert not any("extensao" in path or "parear" in path for path in paths)
+    assert not any("extensao" in path or "parear" in path or "teste-databricks" in path for path in paths)
 
 
 def test_contract_collision_does_not_overwrite_previous_delivery(panel, tmp_path, monkeypatch):

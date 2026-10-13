@@ -64,10 +64,8 @@ services:
       - key: DATABRICKS_VOLUME_ROOT
         value: /Volumes/renapsi_prd/bronze_atestados/atestado
       - key: DATABRICKS_AUTH_MODE
-        value: m2m
-      - key: DATABRICKS_CLIENT_ID
-        sync: false
-      - key: DATABRICKS_CLIENT_SECRET
+        value: token
+      - key: DATABRICKS_TOKEN
         sync: false
       - key: DATABRICKS_TIMEOUT_SECONDS
         value: "60"
