@@ -17,6 +17,11 @@ class QueueItemBusyError(RuntimeError):
     pass
 
 
+def _database_boolean(value: bool | None) -> int | None:
+    """Persiste o contrato booleano do Gemini nas colunas INTEGER dos dois bancos."""
+    return None if value is None else int(value)
+
+
 def understandable_error(error: Exception) -> str:
     """Traduz falhas técnicas sem expor credenciais ou detalhes internos."""
     if isinstance(error, QuotaExceededError) or getattr(error, "status_code", None) == 429:
@@ -162,8 +167,8 @@ def process_queue_item(queue_id: int) -> dict:
                  extracted.get("confianca"), item["arquivo_hash"], json.dumps(extracted, ensure_ascii=False),
                  employee.get("matricula"), employee.get("telefone"), employee.get("email"),
                  employee.get("empresa"), extracted.get("tipo_documento"), enrichment_status,
-                 extracted.get("crm"), extracted.get("crm_uf"), extracted.get("assinado"),
-                 extracted.get("carimbado"), item["operador_id"],None,"aguardando_aprovacao"),
+                 extracted.get("crm"), extracted.get("crm_uf"), _database_boolean(extracted.get("assinado")),
+                 _database_boolean(extracted.get("carimbado")), item["operador_id"],None,"aguardando_aprovacao"),
             )
             atestado_id = cursor.lastrowid
             finished_at = utc_now().isoformat()
