@@ -326,7 +326,7 @@ def test_admin_login_requires_only_valid_user_and_password(tmp_path, monkeypatch
         )
     client = TestClient(main.app, base_url="http://127.0.0.1")
     accepted = client.post(
-        "/login", data={"usuario": "admin", "senha": "Senha-Admin-Forte-123!"},
+        "/login", data={"usuario": "ADMIN", "senha": "Senha-Admin-Forte-123!"},
         follow_redirects=False,
     )
     assert accepted.status_code == 303

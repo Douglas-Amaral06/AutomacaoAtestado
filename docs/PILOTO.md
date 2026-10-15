@@ -39,3 +39,18 @@ O caso 25 é validado também por teste automatizado com dois bancos independent
 Os casos de indisponibilidade/429/falha de integridade são cobertos offline pela suíte. Não provoque consumo artificial da quota real. Para testar falha de entrega no ambiente, use uma configuração controlada e depois restaure-a, preservando a chave interna e os usuários.
 
 A aprovação em modo fake permanece pendente e é exibida como simulação local. O piloto recusa aprovação nesse modo. A validação final requer `DELIVERY_MODE=databricks` e, nesta etapa, o token temporário homologado. OAuth M2M fica para uma etapa posterior.
+# Cutover PostgreSQL/Redis
+
+1. Faça backup verificável do SQLite atual.
+2. Provisione PostgreSQL e execute a aplicação uma vez para criar o schema.
+3. Pare escrita no ambiente antigo e execute manualmente `scripts/migrate_sqlite_to_postgres.py`.
+4. Valide contagens, login, histórico, fila e relatórios no PostgreSQL.
+5. Mantenha `QUEUE_BACKEND=local`; não provisione/ative o Worker separado ainda.
+6. Escolha e implemente armazenamento compartilhado em etapa futura antes de Redis/Worker.
+7. Valide upload, Gemini, revisão e entrega no Volume oficial.
+8. Configure o Warehouse e só então altere `BRONZE_CHECK_ENABLED=true`.
+9. Confira `/diagnostico` com uma sessão administrativa.
+
+Não ative produção enquanto uploads pendentes ainda dependerem de uma instância web que
+pode reiniciar: os metadados sobreviverão no PostgreSQL, mas o arquivo local em `/tmp`
+pode ser perdido. O Volume continua sendo a persistência oficial após a entrega.

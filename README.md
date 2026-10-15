@@ -153,3 +153,22 @@ Testes usam bancos temporários, extração simulada e storage local ou transpor
 ## Próxima fase: integração Fluig
 
 Após validar o piloto: um atestado entregue poderá originar uma tarefa Fluig, com ID, status e data de criação. Nenhum endpoint, mock ou campo de tarefa foi adicionado agora. A identidade interna e o serviço de ingresso são independentes de um futuro provedor corporativo de login.
+# Infraestrutura PostgreSQL e Redis
+
+Em `pilot` e `production`, a aplicação exige PostgreSQL (`DATABASE_URL`). A tabela
+`fila_processamento` continua sendo a fonte durável do estado. Redis/RQ pode ser ativado
+quando o armazenamento compartilhado abaixo estiver configurado.
+
+Consulte [docs/POSTGRES_REDIS.md](docs/POSTGRES_REDIS.md) e
+[docs/OBSERVABILIDADE.md](docs/OBSERVABILIDADE.md) para operação e cutover.
+
+Importante: PostgreSQL persiste estado, não os documentos. Arquivos confirmados permanecem
+no Databricks Volume; uploads pendentes usam o storage temporário configurado.
+## Armazenamento temporário compartilhado
+
+Em `pilot`/`production` com Redis, configure `FILE_STORAGE_BACKEND=supabase`. O bucket privado
+`atestados-temp` guarda apenas o original temporário; o destino oficial continua sendo o Databricks.
+Configure `SUPABASE_URL`, `SUPABASE_SECRET_KEY` e `SUPABASE_STORAGE_BUCKET` somente no servidor.
+Depois de uma entrega confirmada ao Databricks, a aplicação tenta remover o objeto temporário sem
+transformar uma eventual falha de limpeza em falha de entrega. Para uma verificação manual com arquivo
+sintético: `TEST_SUPABASE_ENABLED=true python scripts/test_supabase_storage.py`.

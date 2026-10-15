@@ -140,6 +140,38 @@ def test_size_limits_leave_no_files(panel, monkeypatch, size, reading_limit):
     assert not list(uploads.UPLOAD_DIR.iterdir())
 
 
+def test_supabase_object_is_removed_when_queue_insert_fails(panel, monkeypatch):
+    class RecordingStorage:
+        def __init__(self):
+            self.stored = []
+            self.deleted = []
+
+        def store(self, key, content):
+            self.stored.append((key, content))
+
+        def delete(self, key):
+            self.deleted.append(key)
+
+    storage = RecordingStorage()
+    monkeypatch.setenv("FILE_STORAGE_BACKEND", "supabase")
+    monkeypatch.setattr(uploads, "file_storage", lambda _root: storage)
+    monkeypatch.setattr(uploads, "connect", lambda: (_ for _ in ()).throw(RuntimeError("database unavailable")))
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        uploads.ingest_document(
+            type("Upload", (), {
+                "content_type": "image/jpeg",
+                "filename": "documento.jpg",
+                "file": io.BytesIO(image_bytes()),
+            })(),
+            1,
+        )
+
+    assert len(storage.stored) == 1
+    assert storage.deleted == [storage.stored[0][0]]
+    assert not list(uploads.UPLOAD_DIR.iterdir())
+
+
 def test_rate_limit_is_per_authenticated_user(panel, monkeypatch):
     monkeypatch.setenv("UPLOAD_RATE_LIMIT_PER_HOUR", "1")
     assert send(panel[0]).status_code == 303
@@ -214,10 +246,12 @@ def test_approval_delivers_pair_and_only_then_confirms(panel, tmp_path, monkeypa
     monkeypatch.setattr(storage, "write_binary", write)
     monkeypatch.setattr(storage, "read_binary", verify)
     monkeypatch.setattr(storage, "write_json", write_json)
+    monkeypatch.setattr(main, "schedule_bronze_check", lambda *_args: (_ for _ in ()).throw(RuntimeError()))
     assert approve(client, item, nome="Nome corrigido").status_code == 303
     assert events == ["documento", "sha", "json"]
     saved = record()
     assert saved["status"] == "confirmado" and saved["status_entrega"] == "entregue_volume"
+    assert saved["status_bronze"] == "erro_consulta"
     assert saved["revisado_por"] == operator
     assert saved["matricula"] == "M123" and saved["empresa"] == "Empresa preservada"
     payload = json.loads(next(storage.root.rglob("*.json")).read_text(encoding="utf-8"))

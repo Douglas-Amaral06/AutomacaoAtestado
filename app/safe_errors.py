@@ -30,16 +30,20 @@ def format_safe_error(error: Exception) -> tuple[str, dict]:
         "error_type": error_type,
         "fingerprint": fingerprint,
     }
+    upstream_status = getattr(error, "status_code", None)
+    if isinstance(upstream_status, int) and 100 <= upstream_status <= 599:
+        details["upstream_status"] = upstream_status
     safe_message = f"Falha de processamento. Referência: {correlation_id}"
     # Deliberadamente sem exc_info e sem str(error): tracebacks formatados repetem
     # a mensagem da exceção e podem carregar tokens, URLs ou dados médicos.
     logger.error(
-        "internal_failure correlation_id=%s error_type=%s fingerprint=%s origin=%s:%s:%d",
+        "internal_failure correlation_id=%s error_type=%s fingerprint=%s origin=%s:%s:%d upstream_status=%s",
         correlation_id,
         error_type,
         fingerprint,
         origin_file,
         origin_function,
         origin_line,
+        details.get("upstream_status", "none"),
     )
     return safe_message, details

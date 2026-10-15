@@ -12,7 +12,7 @@ from google import genai
 from google.genai import types
 from PIL import Image, ImageEnhance, ImageOps, UnidentifiedImageError
 
-from .database import connect
+from .database import connect, is_postgres
 
 
 _request_lock = threading.Lock()
@@ -42,10 +42,16 @@ def reserve_gemini_budget(output_tokens: int) -> None:
     daily_tokens = _positive_env_int("GEMINI_DAILY_OUTPUT_TOKEN_BUDGET", 50_000)
     with connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            "INSERT OR IGNORE INTO gemini_consumo(dia,chamadas,tokens_reservados) VALUES(?,0,0)",
-            (day,),
-        )
+        if is_postgres():
+            connection.execute(
+                "INSERT INTO gemini_consumo(dia,chamadas,tokens_reservados) VALUES(?,0,0) ON CONFLICT (dia) DO NOTHING",
+                (day,),
+            )
+        else:
+            connection.execute(
+                "INSERT OR IGNORE INTO gemini_consumo(dia,chamadas,tokens_reservados) VALUES(?,0,0)",
+                (day,),
+            )
         cursor = connection.execute(
             """UPDATE gemini_consumo
                SET chamadas=chamadas+1,tokens_reservados=tokens_reservados+?

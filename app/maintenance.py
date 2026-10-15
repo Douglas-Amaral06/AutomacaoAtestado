@@ -9,7 +9,7 @@ import zipfile
 from datetime import timedelta
 from pathlib import Path, PurePosixPath
 
-from .database import BASE_DIR, DB_PATH, UPLOAD_DIR, connect
+from .database import BASE_DIR, DB_PATH, UPLOAD_DIR, connect, is_postgres
 from .security import utc_now
 
 
@@ -110,10 +110,12 @@ def _sha256(path: Path) -> str:
 
 def create_backup() -> Path:
     """Cria ZIP consistente do banco e anexos, com manifesto verificável."""
+    if is_postgres():
+        raise RuntimeError("O backup local SQLite não se aplica ao PostgreSQL; use o backup gerenciado do provedor.")
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = utc_now().strftime("%Y%m%dT%H%M%SZ")
     destination = BACKUP_DIR / f"atestados-backup-{timestamp}.zip"
-    with tempfile.TemporaryDirectory(prefix="rh-backup-") as temp_name:
+    with tempfile.TemporaryDirectory(prefix="rh-backup-", dir=BACKUP_DIR) as temp_name:
         temp = Path(temp_name)
         database_copy = temp / "atestados.db"
         source = sqlite3.connect(DB_PATH)

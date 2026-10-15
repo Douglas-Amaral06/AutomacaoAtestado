@@ -12,6 +12,7 @@ from pypdf import PdfReader
 from .config import positive_env_int
 from .database import UPLOAD_DIR, connect
 from .databricks_delivery import SAO_PAULO
+from .file_storage import file_storage, storage_key
 
 ALLOWED_TYPES = {"application/pdf", "image/jpeg", "image/png"}
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
@@ -55,7 +56,10 @@ def validate_document_structure(path: Path, mime_type: str) -> None:
 
 def ingest_document(file: UploadFile, operator_id: int) -> int:
     stored_path = None
+    object_key = None
     queue_id = None
+    storage = None
+    remote_storage = os.getenv("FILE_STORAGE_BACKEND", "local").strip().lower() != "local"
     received_at = datetime.now(SAO_PAULO).isoformat()
     try:
         if file.content_type not in ALLOWED_TYPES:
@@ -85,19 +89,31 @@ def ingest_document(file: UploadFile, operator_id: int) -> int:
             raise HTTPException(400, "Conteúdo do arquivo não corresponde ao tipo informado.")
         validate_document_structure(stored_path, actual_mime)
         digest = digest_builder.hexdigest()
+        object_key = storage_key(stored_name)
+        storage = file_storage(UPLOAD_DIR)
+        # A validação, hash e limites acontecem antes de qualquer chamada remota.
+        if remote_storage:
+            storage.store(object_key, stored_path.read_bytes())
         with connect() as connection:
             queue_id = connection.execute("""INSERT INTO fila_processamento(
-                arquivo_hash,arquivo_original,arquivo_salvo,mime_type,status,
+                arquivo_hash,arquivo_original,arquivo_salvo,storage_key,mime_type,status,
                 data_recebimento,unidade,polo,origem,operador_id
-            ) VALUES(?,?,?,?,'aguardando_retentativa',?,?,?,'painel',?)""", (
+            ) VALUES(?,?,?,?,?,'aguardando_retentativa',?,?,?,'painel',?)""", (
                 digest, Path((file.filename or "documento").replace("\\", "/")).name[:255],
-                stored_name, actual_mime, received_at,
+                stored_name, object_key, actual_mime, received_at,
                 os.getenv("DELIVERY_UNIT", "AUREA").strip().upper(),
                 os.getenv("DELIVERY_POLO", "SP").strip().upper(), operator_id,
             )).lastrowid
+        if remote_storage:
+            stored_path.unlink(missing_ok=True)
         return queue_id
     except Exception:
-        if queue_id is None and stored_path:
+        if queue_id is None and object_key and storage is not None and remote_storage:
+            try:
+                storage.delete(object_key)
+            except Exception:
+                pass
+        if stored_path:
             stored_path.unlink(missing_ok=True)
         raise
     finally:

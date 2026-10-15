@@ -18,16 +18,21 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from openpyxl import Workbook
 
-from .database import BASE_DIR, UPLOAD_DIR, connect, initialize_database, new_operator_public_id
+from .database import BASE_DIR, UPLOAD_DIR, connect, initialize_database, new_operator_public_id, is_postgres
 from .databricks_delivery import configured_delivery_service, prepare_processed_delivery, validate_prepared_delivery
 from .maintenance import BACKUP_DIR, apply_retention, create_backup, detect_orphan_files, prune_backups
 from .processing import QueueItemBusyError, add_log, process_queue_item, resume_pending_once, understandable_error
+from .file_storage import file_storage
 from .rate_limit import check_daily_quota, check_rate_limit
 from .safe_errors import format_safe_error
 from .export import safe_excel_value
 from .bootstrap import bootstrap_users
 from .config import positive_env_int
 from .uploads import ingest_document, MAX_MULTIPART_BYTES, UploadBodyLimit
+from .queueing import (enqueue_queue_item, queue_backend, reconcile_pending_jobs,
+                       redis_health, validate_queue_configuration, worker_health)
+from .bronze import schedule_bronze_check
+from .observability import operational_metrics
 from .validation import document_type, normalize_cid, normalize_cpf, validation_summary
 from .security import (SESSION_COOKIE, attempt_retry_after, create_session, current_user,
                        encrypt_totp, hash_password, is_login_blocked, login_keys,
@@ -111,16 +116,10 @@ async def lifespan(_app):
                 "No piloto Render, TRUST_CLOUDFLARE deve ser false"
             )
 
-        databricks_auth_mode = os.getenv(
-            "DATABRICKS_AUTH_MODE",
-            "m2m",
-        ).strip().lower()
+        databricks_auth_mode = os.getenv("DATABRICKS_AUTH_MODE", "token").strip().lower()
 
-        if databricks_auth_mode not in {"m2m", "token"}:
-            raise RuntimeError(
-                "O piloto exige autenticação M2M "
-                "ou token temporário controlado"
-            )
+        if databricks_auth_mode != "token":
+            raise RuntimeError("O piloto exige DATABRICKS_AUTH_MODE=token nesta etapa.")
 
         if (
             databricks_auth_mode == "token"
@@ -131,6 +130,7 @@ async def lifespan(_app):
                 "quando DATABRICKS_AUTH_MODE=token"
             )
 
+    validate_queue_configuration()
     initialize_database()
     bootstrap_users()
 
@@ -165,7 +165,10 @@ async def lifespan(_app):
         name="manutencao-atestados",
     )
 
-    thread.start()
+    if queue_backend() == "redis":
+        reconcile_pending_jobs()
+    else:
+        thread.start()
 
     if os.getenv("LOCAL_BACKUP_ENABLED", "false").lower() == "true":
         maintenance.start()
@@ -205,6 +208,22 @@ def parse_optional_boolean(value: str, field_name: str) -> bool | None:
     if value == "false":
         return False
     raise HTTPException(422, f"Valor inválido para {field_name}.")
+
+
+def schedule_bronze_observability(record_id: int, id_documento: str) -> None:
+    """Bronze é pós-entrega: sua falha nunca invalida o Volume confirmado."""
+    try:
+        schedule_bronze_check(record_id, id_documento)
+    except Exception as error:
+        safe_message, details = format_safe_error(error)
+        with connect() as connection:
+            connection.execute(
+                """UPDATE atestados SET status_bronze='erro_consulta'
+                   WHERE id=? AND status_entrega='entregue_volume'""", (record_id,),
+            )
+        add_log("erro", "bronze_agendamento_falhou", safe_message, {
+            **details, "atestado_id": record_id, "component": "bronze",
+        })
 
 
 def review_context(request: Request, item, user, values: dict | None = None, validation: dict | None = None):
@@ -303,7 +322,9 @@ def login(request: Request, usuario: str = Form(..., min_length=1, max_length=10
         add_log("aviso", "login_bloqueado", "Tentativas excessivas de login bloqueadas", {"aguarde_segundos": retry})
         return RedirectResponse("/login?erro=Bloqueado+temporariamente.+Tente+novamente+mais+tarde", 303)
     with connect() as connection:
-        user = connection.execute("SELECT * FROM usuarios WHERE usuario=? AND ativo=1", (usuario.strip(),)).fetchone()
+        user = connection.execute(
+            "SELECT * FROM usuarios WHERE LOWER(usuario)=LOWER(?) AND ativo=1", (usuario.strip(),)
+        ).fetchone()
     valid = verify_login_password(user, senha)
     record_login(ip_key, valid)
     record_login(account_key, valid)
@@ -399,6 +420,7 @@ def dashboard(request: Request, status: str = "", q: str = "", page: int = 1, pe
         duplicate_hashes = {row[0] for row in connection.execute(
             "SELECT arquivo_hash FROM atestados WHERE arquivo_hash IS NOT NULL GROUP BY arquivo_hash HAVING COUNT(*)>1"
         ).fetchall()}
+    metrics = operational_metrics(1) if user["perfil"] == "admin" else None
     atestados = []
     for row in rows:
         record = dict(row)
@@ -414,6 +436,7 @@ def dashboard(request: Request, status: str = "", q: str = "", page: int = 1, pe
         "page": page, "per_page": per_page,
         "total_pages": max(1, (total + per_page - 1) // per_page), "status_filter": status,
         "search_query": search,
+        "operational_metrics": metrics,
         "user": user, "csrf": user["csrf_token"],
     })
 
@@ -421,6 +444,34 @@ def dashboard(request: Request, status: str = "", q: str = "", page: int = 1, pe
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
+
+
+@app.get("/diagnostico")
+def diagnostics(request: Request):
+    user = current_user(request)
+    require_admin(user)
+    database = "ok"
+    try:
+        with connect() as connection:
+            connection.execute("SELECT 1").fetchone()
+    except Exception:
+        database = "unavailable"
+    redis = "degraded"
+    if queue_backend() == "redis":
+        try:
+            redis = "ok" if redis_health() else "unavailable"
+        except Exception:
+            redis = "unavailable"
+    databricks = "ok" if all(os.getenv(name, "").strip() for name in (
+        "DATABRICKS_HOST", "DATABRICKS_TOKEN")) else "degraded"
+    worker = "degraded"
+    if queue_backend() == "redis":
+        try:
+            worker = "ok" if worker_health() else "unavailable"
+        except Exception:
+            worker = "unavailable"
+    return {"database": database, "redis": redis, "worker": worker,
+            "databricks_config": databricks}
 
 
 @app.get("/atestados/novo", response_class=HTMLResponse)
@@ -461,7 +512,15 @@ def upload_document(request: Request, background_tasks: BackgroundTasks,
     except HTTPException as error:
         return upload_page(request, user, error.detail, error.status_code)
     add_log("info", "upload_recebido", f"Upload #{queue_id} recebido do usuario #{user['id']}")
-    background_tasks.add_task(process_uploaded_item, queue_id)
+    if queue_backend() == "redis":
+        try:
+            enqueue_queue_item(queue_id)
+        except Exception as error:
+            safe_message, details = format_safe_error(error)
+            add_log("erro", "queue_dispatch_failed", safe_message,
+                    {**details, "fila_id": queue_id, "component": "queue"})
+    else:
+        background_tasks.add_task(process_uploaded_item, queue_id)
     return RedirectResponse(f"/envios/{queue_id}", 303)
 
 
@@ -550,7 +609,8 @@ def review_document(
               "motivo_rejeicao": motivo_rejeicao.strip() or None,
               "revisado_por": user["id"], "revisado_em": reservation,
               "status": "pendente" if acao == "aprovar" else "rejeitado",
-              "status_entrega": "entregando" if acao == "aprovar" else "rejeitado"}
+              "status_entrega": "entregando" if acao == "aprovar" else "rejeitado",
+              "entrega_iniciada_em": reservation if acao == "aprovar" else None}
     with connect() as connection:
         assignments = ",".join(f"{key}=?" for key in fields)
         cursor = connection.execute(
@@ -576,10 +636,13 @@ def review_document(
                        LEFT JOIN usuarios u ON u.id=q.operador_id
                        WHERE q.atestado_id=? ORDER BY q.id DESC LIMIT 1""", (record_id,),
                 ).fetchone()
-            document_path = UPLOAD_DIR / before["arquivo_salvo"]
-            if not queue_item or not document_path.is_file():
+            if not queue_item:
                 raise RuntimeError("Original ou metadados indisponíveis")
-            content = document_path.read_bytes()
+            storage = file_storage(UPLOAD_DIR)
+            storage_ref = before["storage_key"] or queue_item["storage_key"] or before["arquivo_salvo"]
+            if not storage.exists(storage_ref):
+                raise RuntimeError("Original ou metadados indisponíveis")
+            content = storage.read(storage_ref)
             if hashlib.sha256(content).hexdigest() != queue_item["arquivo_hash"]:
                 raise RuntimeError("Integridade do original não confere")
             original = json.loads(before["dados_originais"] or "{}")
@@ -608,19 +671,27 @@ def review_document(
             status = "confirmado" if real_delivery else "pendente"
             with connect() as connection:
                 cursor = connection.execute(
-                    """UPDATE atestados SET status=?,status_entrega=?,id_documento=?
+                    """UPDATE atestados SET status=?,status_entrega=?,id_documento=?,entrega_finalizada_em=?
                        WHERE id=? AND revisado_em=? AND status_entrega='entregando'""",
                     (status, "entregue_volume" if real_delivery else "simulado_local",
-                     prepared.payload["id_documento"], record_id, reservation),
+                     prepared.payload["id_documento"], utc_now().isoformat(), record_id, reservation),
                 )
                 if cursor.rowcount != 1:
                     raise RuntimeError("Reserva de entrega perdida")
             add_log("info", "entrega_databricks_concluida", f"Entrega do atestado #{record_id} concluida", {
                 "atestado_id": record_id, "id_documento": prepared.payload["id_documento"],
             })
+            # Limpeza é melhor esforço: uma falha não desfaz entrega já confirmada.
+            if os.getenv("FILE_STORAGE_BACKEND", "local").strip().lower() == "supabase":
+                try:
+                    storage.delete(storage_ref)
+                except Exception:
+                    add_log("aviso", "limpeza_storage_falhou", "Não foi possível limpar o armazenamento temporário", {"atestado_id": record_id})
         except Exception as error:
             safe_message, details = format_safe_error(error)
-            add_log("erro", "entrega_falhou", safe_message, {**details, "atestado_id": record_id})
+            add_log("erro", "entrega_falhou", safe_message, {
+                **details, "atestado_id": record_id, "component": "databricks",
+            })
             with connect() as connection:
                 connection.execute(
                     """UPDATE atestados SET status='pendente',status_entrega='falha_entrega'
@@ -632,9 +703,21 @@ def review_document(
                 "Não foi possível confirmar a entrega ao Databricks. Suas correções foram salvas. "
                 "O registro continua pendente; tente aprovar novamente. Referência: " + details["correlation_id"]
             )
+            if details.get("upstream_status") in {401, 403}:
+                context["delivery_error"] = (
+                    "O Databricks recusou a credencial ou a permissão de acesso. Suas correções foram salvas. "
+                    "Atualize a credencial no Render antes de tentar novamente. Referência: " + details["correlation_id"]
+                )
+            elif details.get("upstream_status") == 429:
+                context["delivery_error"] = (
+                    "O Databricks limitou temporariamente as solicitações. Suas correções foram salvas; "
+                    "aguarde e tente novamente. Referência: " + details["correlation_id"]
+                )
             if isinstance(error, DeliveryCollisionError):
                 context["delivery_error"] = "Outro envio já utiliza este ID Databricks. Suas correções foram salvas. Envie novamente o documento para criar um novo recebimento."
             return templates.TemplateResponse(request=request, name="review.html", context=context, status_code=503)
+        if real_delivery:
+            schedule_bronze_observability(record_id, prepared.payload["id_documento"])
     changed_values = {**locals(), "assinado": signed_value, "carimbado": stamped_value, "crm_uf": reviewed["crm_uf"]}
     add_log("info","revisao",f"Atestado #{record_id} {status} por usuario #{user['id']}",{"campos_alterados":[k for k in ("nome","cpf","cid","dias_afastamento","data_atestado","observacoes","crm","crm_uf","assinado","carimbado") if str(before[k] if before[k] is not None else "")!=str(changed_values[k] if changed_values[k] is not None else "")]})
     return RedirectResponse("/",303)
@@ -646,7 +729,7 @@ def delete_document(record_id:int, request:Request, csrf_token:str=Form(...)):
     require_permission(user, "delete")
     with connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
-        item=connection.execute("SELECT arquivo_salvo,arquivo_hash,status_entrega FROM atestados WHERE id=?",(record_id,)).fetchone()
+        item=connection.execute("SELECT arquivo_salvo,storage_key,arquivo_hash,status_entrega FROM atestados WHERE id=?",(record_id,)).fetchone()
         if not item:raise HTTPException(404,"Registro inexistente")
         if item["status_entrega"] == "entregando":
             raise HTTPException(409, "Aguarde a entrega antes de excluir o registro.")
@@ -654,7 +737,8 @@ def delete_document(record_id:int, request:Request, csrf_token:str=Form(...)):
         connection.execute("DELETE FROM atestados WHERE id=?",(record_id,))
         still_used=connection.execute("SELECT COUNT(*) FROM atestados WHERE arquivo_salvo=?",(item["arquivo_salvo"],)).fetchone()[0]
     if not still_used:
-        (UPLOAD_DIR/item["arquivo_salvo"]).unlink(missing_ok=True)
+        try: file_storage(UPLOAD_DIR).delete(item["storage_key"] or item["arquivo_salvo"])
+        except Exception: pass
     add_log("aviso","atestado_excluido",f"Atestado #{record_id} e arquivo removidos pelo usuario #{user['id']}")
     return RedirectResponse("/",303)
 
@@ -664,11 +748,12 @@ def download_original(record_id:int, request:Request):
     user = web_user(request)
     if not user: return RedirectResponse("/login",303)
     require_permission(user, "review")
-    with connect() as connection: row=connection.execute("SELECT arquivo_original,arquivo_salvo FROM atestados WHERE id=?",(record_id,)).fetchone()
+    with connect() as connection: row=connection.execute("SELECT arquivo_original,arquivo_salvo,storage_key FROM atestados WHERE id=?",(record_id,)).fetchone()
     if not row: raise HTTPException(404,"Registro inexistente")
-    if not (UPLOAD_DIR / row["arquivo_salvo"]).is_file():
-        raise HTTPException(404, "Original local indisponível. Documentos confirmados permanecem no Databricks.")
-    return FileResponse(UPLOAD_DIR/row["arquivo_salvo"],filename=row["arquivo_original"],headers={"Content-Disposition":f"inline; filename=\"documento-{record_id}{Path(row['arquivo_original']).suffix}\""})
+    storage = file_storage(UPLOAD_DIR)
+    try: content = storage.read(row["storage_key"] or row["arquivo_salvo"])
+    except FileNotFoundError: raise HTTPException(404, "Original temporário indisponível.") from None
+    return StreamingResponse(io.BytesIO(content), media_type="application/octet-stream", headers={"Content-Disposition":f"inline; filename=\"documento-{record_id}{Path(row['arquivo_original']).suffix}\""})
 
 
 @app.get("/logs",response_class=HTMLResponse)
@@ -832,7 +917,10 @@ def reports(request:Request):
     with connect() as connection:
         summary=connection.execute("SELECT COUNT(*) total,SUM(CASE WHEN status='pendente' THEN 1 ELSE 0 END) pendentes,SUM(CASE WHEN status='confirmado' THEN 1 ELSE 0 END) confirmados,SUM(CASE WHEN status='rejeitado' THEN 1 ELSE 0 END) rejeitados,COALESCE(SUM(CASE WHEN status='confirmado' THEN dias_afastamento ELSE 0 END),0) dias FROM atestados").fetchone()
         monthly=connection.execute("SELECT substr(COALESCE(data_atestado,criado_em),1,7) mes,COUNT(*) quantidade,COALESCE(SUM(dias_afastamento),0) dias FROM atestados GROUP BY mes ORDER BY mes DESC LIMIT 12").fetchall()
-        timing=connection.execute("SELECT ROUND(AVG((julianday(revisado_em)-julianday(criado_em))*24),2) horas FROM atestados WHERE revisado_em IS NOT NULL").fetchone()
+        if is_postgres():
+            timing=connection.execute("SELECT ROUND(AVG(EXTRACT(EPOCH FROM (revisado_em::timestamptz-criado_em::timestamptz))/3600)::numeric,2) horas FROM atestados WHERE revisado_em IS NOT NULL").fetchone()
+        else:
+            timing=connection.execute("SELECT ROUND(AVG((julianday(revisado_em)-julianday(criado_em))*24),2) horas FROM atestados WHERE revisado_em IS NOT NULL").fetchone()
     return templates.TemplateResponse(request=request,name="reports.html",context={"summary":summary,"monthly":monthly,"timing":timing,"user":user,"csrf":user["csrf_token"]})
 
 

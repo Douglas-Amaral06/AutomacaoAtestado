@@ -13,6 +13,31 @@
 {% if 'upload' in permissions %}
 <div class="section"><a href="/atestados/novo" class="btn btn-primary">Enviar atestado</a></div>
 {% endif %}
+{% if operational_metrics %}
+<div class="section">
+  <h2 class="section-title">Central operacional — últimas 24 horas</h2>
+  <div class="container-grid">
+    {% for value, label in [
+      (operational_metrics.received, 'Recebidos'),
+      (operational_metrics.extracted, 'Extraídos'),
+      (operational_metrics.approved, 'Aprovados'),
+      (operational_metrics.rejected, 'Rejeitados'),
+      (operational_metrics.gemini_failures, 'Falhas Gemini'),
+      (operational_metrics.databricks_failures, 'Falhas Databricks'),
+      (operational_metrics.queue_failures, 'Falhas de fila'),
+      (operational_metrics.bronze_failures, 'Falhas Bronze'),
+      (operational_metrics.delivered, 'Entregues ao Volume'),
+      (operational_metrics.bronze_confirmed, 'Ingeridos na Bronze'),
+      (operational_metrics.bronze_waiting, 'Aguardando Bronze'),
+      (operational_metrics.bronze_errors, 'Erro de consulta Bronze')
+    ] %}
+    <div class="stat-card"><div class="stat-card-content"><div class="stat-card-value">{{ value }}</div><div class="stat-card-label">{{ label }}</div></div></div>
+    {% endfor %}
+    <div class="stat-card"><div class="stat-card-content"><div class="stat-card-value">{{ operational_metrics.average_extraction_seconds }} s</div><div class="stat-card-label">Tempo médio de extração</div></div></div>
+    <div class="stat-card" title="Extrações e entregas técnicas concluídas / total de tentativas técnicas. Rejeições humanas e documentos não-atestado não entram no cálculo."><div class="stat-card-content"><div class="stat-card-value">{{ operational_metrics.success_rate }}%</div><div class="stat-card-label">Taxa operacional de sucesso ⓘ</div></div></div>
+  </div>
+</div>
+{% endif %}
 <!-- Fila de Processamento -->
 {% if queue %}
 <div class="section">
@@ -287,6 +312,7 @@
           <th>Dias</th>
           <th>Status</th>
           <th>Entrega</th>
+          <th>Bronze</th>
           <th>Operador</th>
           <th>Confiança</th>
           <th></th>
@@ -345,6 +371,16 @@
             {% if item.id_documento %}
             <code title="{{ item.id_documento }}" style="display:block;margin-top:var(--space-2);max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{{ item.id_documento }}</code>
             {% endif %}
+          </td>
+          <td>
+            {% set bronze_ui = {
+              'confirmado': ('badge-success', 'Confirmado'),
+              'aguardando': ('badge-warning', 'Aguardando'),
+              'nao_encontrado': ('badge-neutral', 'Não encontrado'),
+              'erro_consulta': ('badge-error', 'Erro de consulta'),
+              'nao_verificado': ('badge-neutral', 'Não verificado')
+            }.get(item.status_bronze, ('badge-neutral', 'Não verificado')) %}
+            <span class="badge {{ bronze_ui[0] }}">{{ bronze_ui[1] }}</span>
           </td>
           <td>{{ item.operador_envio_nome or 'Não identificado' }}</td>
           <td>{{ item.confianca or '—' }}</td>

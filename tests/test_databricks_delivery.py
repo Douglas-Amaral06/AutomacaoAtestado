@@ -5,13 +5,17 @@ from datetime import datetime, timedelta
 from pathlib import PurePosixPath
 
 import pytest
+from urllib.error import HTTPError
 
 from app.databricks_delivery import (
     ContractValidationError, DeliveryService, LocalDeliverySimulator, SAO_PAULO,
     configured_delivery_service, prepare_delivery, prepare_processed_delivery,
     sha256_bytes, validate_prepared_delivery,
 )
-from app.storage_client import DatabricksStorageClient, LocalFakeStorageClient
+from app.storage_client import (
+    DatabricksStorageClient, DatabricksTokenStorageClient,
+    LocalFakeStorageClient, StorageCommunicationError,
+)
 from scripts.simular_entrega_databricks import carregar_registros, simular_entregas
 from scripts.homologar_entrega_fake import homologar
 from scripts import homologar_databricks
@@ -309,6 +313,23 @@ class _FakeHttpResponse:
 
     def read(self):
         return self._body
+
+
+def test_token_client_preserva_status_http_sem_expor_resposta(monkeypatch):
+    def unauthorized(request, timeout):
+        raise HTTPError(request.full_url, 401, "resposta sensivel", {}, None)
+
+    monkeypatch.setattr("app.storage_client.urlopen", unauthorized)
+    storage = DatabricksTokenStorageClient(
+        host="https://dbc-ficticio.cloud.databricks.com",
+        token="token-ficticio",
+        volume_root="/Volumes/catalogo/schema/volume",
+        max_attempts=1,
+    )
+    with pytest.raises(StorageCommunicationError) as captured:
+        storage.check_directory_access()
+    assert captured.value.status_code == 401
+    assert "sensivel" not in str(captured.value)
 
 
 def test_databricks_client_usa_oauth_cache_e_files_api(monkeypatch):

@@ -17,6 +17,14 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 
+class StorageCommunicationError(RuntimeError):
+    """Falha externa com status HTTP seguro, sem corpo ou credenciais."""
+
+    def __init__(self, status_code: int | None = None) -> None:
+        super().__init__("Falha na comunicação com a Files API do Databricks.")
+        self.status_code = status_code
+
+
 class StorageClient(Protocol):
     """Contrato mínimo de armazenamento usado pela camada de entrega."""
 
@@ -671,10 +679,8 @@ class DatabricksStorageClient:
                     )
                 )
 
-        raise RuntimeError(
-            "Falha na comunicação com "
-            "a Files API do Databricks."
-        ) from last_error
+        status_code = last_error.code if isinstance(last_error, HTTPError) else None
+        raise StorageCommunicationError(status_code) from last_error
 
 
 class DatabricksTokenStorageClient(

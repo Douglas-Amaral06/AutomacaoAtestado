@@ -1,5 +1,7 @@
 import sqlite3
 import uuid
+import os
+import re
 from .config import BASE_DIR, DATA_DIR
 
 
@@ -12,7 +14,29 @@ def new_operator_public_id() -> str:
     return f"opr_{uuid.uuid4().hex}"
 
 
+def database_url() -> str:
+    return os.getenv("DATABASE_URL", "").strip()
+
+
+def is_postgres() -> bool:
+    return database_url().startswith(("postgresql://", "postgres://"))
+
+
+def validate_database_configuration() -> None:
+    env = os.getenv("APP_ENV", "development").strip().lower()
+    if env in {"pilot", "production"} and not is_postgres():
+        raise RuntimeError("DATABASE_URL PostgreSQL é obrigatória neste ambiente.")
+
+
 def initialize_database() -> None:
+    validate_database_configuration()
+    if is_postgres():
+        _initialize_postgres()
+        return
+    _initialize_sqlite()
+
+
+def _initialize_sqlite() -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as connection:
         connection.execute(
@@ -56,6 +80,13 @@ def initialize_database() -> None:
             "operador_envio_id": "INTEGER",
             "id_documento": "TEXT",
             "status_entrega": "TEXT",
+            "status_bronze": "TEXT NOT NULL DEFAULT 'nao_verificado'",
+            "bronze_verificado_em": "TEXT",
+            "processamento_iniciado_em": "TEXT",
+            "processamento_finalizado_em": "TEXT",
+            "entrega_iniciada_em": "TEXT",
+            "entrega_finalizada_em": "TEXT",
+            "storage_key": "TEXT",
         }.items():
             if column not in columns:
                 connection.execute(f"ALTER TABLE atestados ADD COLUMN {column} {definition}")
@@ -103,6 +134,7 @@ def initialize_database() -> None:
                 arquivo_hash TEXT NOT NULL,
                 arquivo_original TEXT NOT NULL,
                 arquivo_salvo TEXT NOT NULL,
+                storage_key TEXT,
                 mime_type TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'processando',
                 tentativas INTEGER NOT NULL DEFAULT 0,
@@ -142,6 +174,20 @@ def initialize_database() -> None:
             )
             """
         )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS bronze_checks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                atestado_id INTEGER NOT NULL UNIQUE,
+                id_documento TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'aguardando',
+                tentativas INTEGER NOT NULL DEFAULT 0,
+                disponivel_em TEXT,
+                ultimo_erro TEXT,
+                criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                atualizado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(atestado_id) REFERENCES atestados(id)
+            )"""
+        )
         # Versões antigas persistiam mensagens cruas de exceção. Preserva o
         # evento e a data, removendo somente os campos que podiam conter segredos.
         connection.execute(
@@ -167,6 +213,7 @@ def _migrate_queue(connection: sqlite3.Connection) -> None:
         "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
         "arquivo_hash": "TEXT NOT NULL", "arquivo_original": "TEXT NOT NULL",
         "arquivo_salvo": "TEXT NOT NULL", "mime_type": "TEXT NOT NULL",
+        "storage_key": "TEXT",
         "status": "TEXT NOT NULL DEFAULT 'aguardando_retentativa'",
         "tentativas": "INTEGER NOT NULL DEFAULT 0", "ultimo_erro": "TEXT",
         "erro_amigavel": "TEXT", "disponivel_em": "TEXT", "atestado_id": "INTEGER",
@@ -215,9 +262,152 @@ def _migrate_queue(connection: sqlite3.Connection) -> None:
         raise
 
 
-def connect() -> sqlite3.Connection:
+def connect():
+    if is_postgres():
+        return _PostgresConnection()
     connection = sqlite3.connect(DB_PATH)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
     return connection
+
+
+class _PgCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.rowcount = cursor.rowcount
+        self.lastrowid = None
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    def fetchmany(self, size=1):
+        return self._cursor.fetchmany(size)
+
+    def __iter__(self):
+        return iter(self._cursor)
+
+
+class _PostgresConnection:
+    """Adaptador DB-API pequeno para preservar as queries incrementais existentes."""
+
+    def __init__(self):
+        from psycopg import connect as pg_connect
+        url = database_url()
+        if url.startswith("postgres://"):
+            url = "postgresql://" + url[len("postgres://"):]
+        self._connection = pg_connect(url, row_factory=_hybrid_row_factory)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type:
+            self._connection.rollback()
+        else:
+            self._connection.commit()
+        self._connection.close()
+
+    def execute(self, sql, params=()):
+        normalized = sql.strip()
+        if normalized.upper() == "BEGIN IMMEDIATE":
+            return _PgCursor(self._connection.execute("SELECT 1"))
+        normalized = normalized.replace("COLLATE NOCASE", "")
+        normalized = re.sub(r"\binstr\(([^,]+),\s*\?\)\s*>\s*0", r"POSITION(%s IN \1) > 0", normalized, flags=re.I)
+        normalized = normalized.replace("?", "%s")
+        cursor = self._connection.execute(normalized, params)
+        wrapped = _PgCursor(cursor)
+        insert_match = re.match(r"\s*INSERT\s+INTO\s+([a-z_]+)", normalized, re.I)
+        if insert_match and insert_match.group(1).lower() != "gemini_consumo":
+            wrapped.lastrowid = self._connection.execute("SELECT LASTVAL()").fetchone()["lastval"]
+        return wrapped
+
+
+_POSTGRES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS usuarios (
+ id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, usuario TEXT NOT NULL,
+ nome TEXT NOT NULL, senha_hash TEXT NOT NULL, totp_secret_encrypted TEXT NOT NULL,
+ perfil TEXT NOT NULL CHECK(perfil IN ('admin','analista')), ativo INTEGER NOT NULL DEFAULT 1,
+ criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, ultimo_login TEXT, operador_public_id TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_usuarios_usuario_ci ON usuarios (LOWER(usuario));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_usuarios_operador_public_id ON usuarios(operador_public_id);
+CREATE TABLE IF NOT EXISTS atestados (
+ id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, nome TEXT, cpf TEXT, cid TEXT,
+ dias_afastamento INTEGER, data_atestado TEXT, arquivo_original TEXT NOT NULL, arquivo_salvo TEXT NOT NULL, storage_key TEXT,
+ status TEXT NOT NULL DEFAULT 'pendente', observacoes TEXT, confianca TEXT,
+ criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, revisado_em TEXT, arquivo_hash TEXT,
+ revisado_por BIGINT, motivo_rejeicao TEXT, dados_originais TEXT, matricula TEXT, telefone TEXT,
+ email TEXT, empresa TEXT, tipo_documento TEXT, status_enriquecimento TEXT, crm TEXT, crm_uf TEXT,
+ assinado INTEGER, carimbado INTEGER, operador_envio_id BIGINT, id_documento TEXT, status_entrega TEXT,
+ status_bronze TEXT NOT NULL DEFAULT 'nao_verificado', bronze_verificado_em TEXT,
+ processamento_iniciado_em TEXT, processamento_finalizado_em TEXT,
+ entrega_iniciada_em TEXT, entrega_finalizada_em TEXT);
+ALTER TABLE atestados ADD COLUMN IF NOT EXISTS status_bronze TEXT NOT NULL DEFAULT 'nao_verificado';
+ALTER TABLE atestados ADD COLUMN IF NOT EXISTS bronze_verificado_em TEXT;
+ALTER TABLE atestados ADD COLUMN IF NOT EXISTS processamento_iniciado_em TEXT;
+ALTER TABLE atestados ADD COLUMN IF NOT EXISTS processamento_finalizado_em TEXT;
+ALTER TABLE atestados ADD COLUMN IF NOT EXISTS entrega_iniciada_em TEXT;
+ALTER TABLE atestados ADD COLUMN IF NOT EXISTS entrega_finalizada_em TEXT;
+ALTER TABLE atestados ADD COLUMN IF NOT EXISTS storage_key TEXT;
+CREATE INDEX IF NOT EXISTS idx_atestados_arquivo_hash ON atestados(arquivo_hash);
+CREATE INDEX IF NOT EXISTS idx_atestados_id_documento ON atestados(id_documento);
+CREATE TABLE IF NOT EXISTS sessoes (
+ id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, usuario_id BIGINT NOT NULL REFERENCES usuarios(id),
+ token_hash TEXT NOT NULL UNIQUE, csrf_token TEXT NOT NULL, ip_hash TEXT, user_agent_hash TEXT,
+ expira_em TEXT NOT NULL, criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS tentativas_login (
+ id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, chave_hash TEXT NOT NULL,
+ sucesso INTEGER NOT NULL, criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_login_chave_data ON tentativas_login(chave_hash, criado_em);
+CREATE TABLE IF NOT EXISTS gemini_consumo (dia TEXT PRIMARY KEY, chamadas INTEGER NOT NULL DEFAULT 0,
+ tokens_reservados INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS fila_processamento (
+ id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, arquivo_hash TEXT NOT NULL,
+ arquivo_original TEXT NOT NULL, arquivo_salvo TEXT NOT NULL, storage_key TEXT, mime_type TEXT NOT NULL,
+ status TEXT NOT NULL DEFAULT 'aguardando_retentativa', tentativas INTEGER NOT NULL DEFAULT 0,
+ ultimo_erro TEXT, erro_amigavel TEXT, disponivel_em TEXT, atestado_id BIGINT REFERENCES atestados(id),
+ criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, atualizado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ data_recebimento TEXT, unidade TEXT, polo TEXT, origem TEXT NOT NULL DEFAULT 'painel', operador_id BIGINT,
+ lock_token TEXT, lock_expires_em TEXT);
+CREATE INDEX IF NOT EXISTS idx_fila_status ON fila_processamento(status, disponivel_em);
+CREATE INDEX IF NOT EXISTS idx_fila_arquivo_hash ON fila_processamento(arquivo_hash);
+ALTER TABLE fila_processamento ADD COLUMN IF NOT EXISTS storage_key TEXT;
+CREATE TABLE IF NOT EXISTS logs (id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+ nivel TEXT NOT NULL, evento TEXT NOT NULL, mensagem TEXT NOT NULL, detalhes TEXT,
+ criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS bronze_checks (
+ id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, atestado_id BIGINT NOT NULL UNIQUE REFERENCES atestados(id),
+ id_documento TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'aguardando', tentativas INTEGER NOT NULL DEFAULT 0,
+ disponivel_em TEXT, ultimo_erro TEXT, criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ atualizado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+"""
+
+
+def _initialize_postgres() -> None:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    with _PostgresConnection() as connection:
+        for statement in _POSTGRES_SCHEMA.split(";"):
+            if statement.strip():
+                connection.execute(statement)
+
+
+class HybridRow(dict):
+    def __init__(self, names, values):
+        super().__init__(zip(names, values))
+        self._values = tuple(values)
+
+    def __getitem__(self, key):
+        return self._values[key] if isinstance(key, int) else super().__getitem__(key)
+
+    def __iter__(self):
+        return iter(self._values)
+
+
+def _hybrid_row_factory(cursor):
+    # DDL/DML sem RETURNING não possui result set no psycopg. A fábrica ainda
+    # precisa existir para a conexão, mas só será chamada para linhas de SELECT.
+    names = [column.name for column in (cursor.description or ())]
+    return lambda values: HybridRow(names, values)

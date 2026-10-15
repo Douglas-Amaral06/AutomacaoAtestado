@@ -3,6 +3,8 @@
 .uv-cache/
 .pytest-tmp/
 .pytest_cache/
+.pytest_*/
+.test-temp/
 __pycache__/
 *.pyc
 data/*.db

@@ -31,3 +31,16 @@
 - `PIPELINE_ATESTADOS_PATH`, `PIPELINE_BASE_GERAL_PATH` e `PIPELINE_OUTPUT_DIR`: não possuem referência no código atual e pertencem ao pipeline local antigo.
 
 Essas quatro variáveis podem ser removidas do Render. A remoção não altera a Files API, o contrato JSON, os caminhos ou a entrega ao Volume.
+# Persistência e fila
+
+- `DATABASE_URL`: URL PostgreSQL. Obrigatória em `pilot`/`production`; nunca versionar.
+- `QUEUE_BACKEND`: deve permanecer `local` em `pilot`/`production` enquanto `/tmp` não for compartilhado.
+- `REDIS_URL`: conexão privada Redis/Key Value; obrigatória com backend `redis`.
+- `QUEUE_NAME`: nome da fila RQ (padrão `atestados`).
+- `QUEUE_JOB_TIMEOUT_SECONDS`: limite do job pesado (padrão 900).
+- `QUEUE_RECONCILE_INTERVAL_SECONDS`: intervalo do reconciliador do worker (mínimo 30, padrão 60).
+- `BRONZE_CHECK_ENABLED`: habilita confirmação assíncrona, somente leitura.
+- `DATABRICKS_SQL_WAREHOUSE_ID`: Warehouse usado na Statement Execution API.
+
+`DATA_DIR` continua servindo apenas para uploads temporários e SQLite local. Não é a
+persistência do banco no Render.

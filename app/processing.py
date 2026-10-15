@@ -10,6 +10,7 @@ from .gemini_service import QuotaExceededError, extract_document
 from .safe_errors import format_safe_error
 from .security import redact, utc_now
 from .validation import normalize_cid, normalize_cpf, validation_summary
+from .file_storage import file_storage, local_copy
 
 
 class QueueItemBusyError(RuntimeError):
@@ -29,6 +30,20 @@ def understandable_error(error: Exception) -> str:
     if isinstance(error, QueueItemBusyError):
         return "Este documento já está sendo processado por outra instância do servidor."
     return "A extração não pôde ser concluída. Consulte os logs técnicos e tente reprocessar."
+
+
+def error_component(error: Exception) -> str:
+    if isinstance(error, FileNotFoundError):
+        return "filesystem"
+    if isinstance(error, QueueItemBusyError):
+        return "queue"
+    if isinstance(error, QuotaExceededError) or getattr(error, "status_code", None) in {
+        401, 403, 408, 429, 500, 502, 503, 504,
+    }:
+        return "gemini"
+    if isinstance(error, (TimeoutError, ConnectionError, json.JSONDecodeError)):
+        return "gemini"
+    return "application"
 
 
 def _claim_queue_item(queue_id: int):
@@ -101,17 +116,21 @@ def sanitize_log_details(value, key: str = ""):
 
 def process_queue_item(queue_id: int) -> dict:
     item, lock_token = _claim_queue_item(queue_id)
-    path = UPLOAD_DIR / item["arquivo_salvo"]
     try:
-        if not path.is_file():
-            raise FileNotFoundError(path.name)
+        storage = file_storage(UPLOAD_DIR)
+        key = item["storage_key"] or item["arquivo_salvo"]
+        if not storage.exists(key):
+            raise FileNotFoundError(item["arquivo_salvo"])
         renew_queue_lease(queue_id, lock_token)
         add_log("info", "extracao_iniciada", f"Extracao do upload #{queue_id} iniciada", {"fila_id": queue_id})
-        extracted = extract_document(path)
+        with local_copy(storage, key, Path(item["arquivo_salvo"]).suffix) as path:
+            extracted = extract_document(path)
         extracted["cpf"] = normalize_cpf(extracted.get("cpf"))
         extracted["cid"] = normalize_cid(extracted.get("cid"))
         if extracted.get("is_atestado") is not True or not normalize_delivery_document_type(extracted.get("tipo_documento")):
-            path.unlink(missing_ok=True)
+            # Só marca como ignorado depois que o original temporário foi removido.
+            # Se o storage estiver indisponível, o fluxo normal de retentativa preserva o arquivo.
+            storage.delete(key)
             with connect() as connection:
                 connection.execute(
                     """UPDATE fila_processamento SET status='ignorado',ultimo_erro=?,erro_amigavel=?,
@@ -133,13 +152,13 @@ def process_queue_item(queue_id: int) -> dict:
                 raise QueueItemBusyError("A posse do item expirou durante o processamento")
             cursor = connection.execute(
                 """INSERT INTO atestados(nome,cpf,cid,dias_afastamento,data_atestado,
-                   arquivo_original,arquivo_salvo,observacoes,confianca,arquivo_hash,dados_originais,
+                   arquivo_original,arquivo_salvo,storage_key,observacoes,confianca,arquivo_hash,dados_originais,
                    matricula,telefone,email,empresa,tipo_documento,status_enriquecimento,
                    crm,crm_uf,assinado,carimbado,operador_envio_id,id_documento,status_entrega)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (extracted.get("nome"), extracted.get("cpf"), extracted.get("cid"),
                  extracted.get("dias_afastamento"), extracted.get("data_atestado"),
-                 item["arquivo_original"], item["arquivo_salvo"], extracted.get("observacoes"),
+                 item["arquivo_original"], item["arquivo_salvo"], item["storage_key"], extracted.get("observacoes"),
                  extracted.get("confianca"), item["arquivo_hash"], json.dumps(extracted, ensure_ascii=False),
                  employee.get("matricula"), employee.get("telefone"), employee.get("email"),
                  employee.get("empresa"), extracted.get("tipo_documento"), enrichment_status,
@@ -147,11 +166,16 @@ def process_queue_item(queue_id: int) -> dict:
                  extracted.get("carimbado"), item["operador_id"],None,"aguardando_aprovacao"),
             )
             atestado_id = cursor.lastrowid
+            finished_at = utc_now().isoformat()
+            connection.execute(
+                "UPDATE atestados SET processamento_iniciado_em=?,processamento_finalizado_em=? WHERE id=?",
+                (item["atualizado_em"] or item["criado_em"], finished_at, atestado_id),
+            )
             connection.execute(
                 """UPDATE fila_processamento SET status='concluido',atestado_id=?,ultimo_erro=NULL,
                    erro_amigavel=NULL,lock_token=NULL,lock_expires_em=NULL,atualizado_em=?
                    WHERE id=? AND lock_token=?""",
-                (atestado_id, utc_now().isoformat(), queue_id, lock_token),
+                (atestado_id, finished_at, queue_id, lock_token),
             )
         add_log("info", "atestado_salvo", f"Atestado #{atestado_id} salvo para conferencia", {"entrega": "aguardando_aprovacao"})
         add_log("info", "extracao_concluida", f"Extracao do upload #{queue_id} concluida", {
@@ -174,7 +198,7 @@ def process_queue_item(queue_id: int) -> dict:
                    disponivel_em=?,lock_token=NULL,lock_expires_em=NULL,atualizado_em=? WHERE id=? AND lock_token=?""",
                 (safe_message, friendly, (utc_now() + timedelta(seconds=error.retry_after or 60)).isoformat(), utc_now().isoformat(), queue_id, lock_token),
             )
-        add_log("aviso", "tarefa_pausada_quota", safe_message, {**safe_details, "fila_id": queue_id, "aguarde_segundos": error.retry_after})
+        add_log("aviso", "tarefa_pausada_quota", safe_message, {**safe_details, "fila_id": queue_id, "aguarde_segundos": error.retry_after, "component": "gemini"})
         raise
     except Exception as error:
         safe_message, safe_details = format_safe_error(error)
@@ -187,7 +211,9 @@ def process_queue_item(queue_id: int) -> dict:
                    lock_token=NULL,lock_expires_em=NULL,atualizado_em=? WHERE id=? AND lock_token=?""",
                 (status, safe_message, friendly, (utc_now() + timedelta(minutes=2)).isoformat(), utc_now().isoformat(), queue_id, lock_token),
             )
-        add_log("erro", "processamento_falhou", safe_message, {**safe_details, "fila_id": queue_id})
+        add_log("erro", "processamento_falhou", safe_message, {
+            **safe_details, "fila_id": queue_id, "component": error_component(error),
+        })
         raise
 
 
